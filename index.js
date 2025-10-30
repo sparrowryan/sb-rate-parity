@@ -11,7 +11,16 @@ function n(x){ return (typeof x === "number" && isFinite(x)) ? x : ""; }
 
 (async () => {
   const today = dayjs().format("YYYY-MM-DD");
-  const hotels = await getSparrowHotels(40);
+  
+// Fetch more pages with pagination support
+const hotels = await getSparrowHotels({
+  maxHotels: 600,   // how many total hotels you want to collect
+  maxPages: 40      // safety cap in case pagination is endless
+});
+
+console.log("Found hotels:", hotels.length);
+console.log("Sample hotels:", hotels.slice(0, 5));
+
 
   const rows = [];
   for (const h of hotels) {
