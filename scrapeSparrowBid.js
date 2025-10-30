@@ -1,80 +1,110 @@
 import { chromium } from "playwright";
 
 /**
- * Scrapes ALL visible pages even when the URL never changes.
- * Strategy:
- * - Keep clicking "Next" (or page numbers) while the number of cards increases.
- * - After each click, wait until either:
- *     a) card count increases, or
- *     b) the first card’s name changes, or
- *     c) 8s timeout (then we stop).
- * - De-dupe globally by name|city.
+ * Scrape SparrowBid Explore with client-side pagination.
+ * - Supports multiple card types (today's deals + standard explore cards)
+ * - If card has no <a>, optionally CLICK to capture the final URL
  */
-export async function getSparrowHotels({ maxHotels = 800, maxPages = 50 } = {}) {
+export async function getSparrowHotels({
+  maxHotels = 600,
+  maxPages = 40,
+  fetchUrls = true,       // click-through to collect SparrowBid URL when missing
+  settleMs = 500
+} = {}) {
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
 
-  await page.goto("https://www.sparrowbid.com/explore", {
-    waitUntil: "networkidle",
-    timeout: 120000,
-  });
+  await page.goto("https://www.sparrowbid.com/explore", { waitUntil: "networkidle", timeout: 120000 });
 
-  // helper: extract cards on current view
-  async function extractCards() {
-    return await page.$$eval(".sb_todays_deals_card_ctn", (cards) => {
-      const dollars = (s) => {
-        const m = String(s || "").match(/\$\s?\d[\d,]*/);
-        return m ? m[0] : null;
-      };
-      const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+  // Helper to extract cards currently rendered
+  async function extractCardsOnPage() {
+    const items = await page.$$eval(
+      ".sb_todays_deals_card_ctn, .sb_explore_card_ctn, .sb_card, [class*='deals_card_ctn'], [class*='explore_card_ctn']",
+      (cards) => {
+        const clean = (s) => (s || "").replace(/\s+/g, " ").trim();
+        const dollars = (s) => {
+          const m = String(s || "").match(/\$\s?\d[\d,]*/);
+          return m ? m[0] : null;
+        };
 
-      const out = [];
-      for (const card of cards) {
-        const name = clean(card.querySelector(".sb_todays_deals_card_heading")?.textContent);
-        if (!name) continue;
+        const out = [];
+        for (const card of cards) {
+          const name =
+            clean(
+              card.querySelector(".sb_todays_deals_card_heading, .sb_explore_card_heading, h1, h2, h3, h4")?.textContent
+            ) || "";
 
-        // "New York, US - 5385.12 mi away" → "New York, US"
-        const cityLine = clean(card.querySelector(".sb_todays_deals_card_country_ctn p")?.textContent);
-        const city = cityLine ? clean(cityLine.split(" - ")[0]) : "";
+          if (!name) continue;
 
-        const priceRaw = dollars(card.querySelector(".sb_todays_deals_card_price")?.textContent);
-        const url = card.closest("a")?.href || card.querySelector("a")?.href || "";
+          // "City, CC - 1234 mi away" → take left side of " - "
+          const cityLine = clean(
+            card.querySelector(".sb_todays_deals_card_country_ctn p, .sb_explore_card_country_ctn p, .location, .subtitle")?.textContent
+          );
+          const city = cityLine ? clean(cityLine.split(" - ")[0]) : "";
 
-        out.push({ name, city, priceRaw, url });
+          const priceRaw = dollars(
+            card.querySelector(".sb_todays_deals_card_price, .sb_explore_card_price, [class*='price']")?.textContent
+          );
+
+          // Try to find a link; many cards are button-only
+          const url =
+            card.querySelector("a[href^='/']")?.href ||
+            card.closest("a")?.href ||
+            card.querySelector("a")?.href ||
+            "";
+
+          out.push({ name, city, priceRaw, urlSelectorPath: getPath(card), url });
+        }
+
+        // Helper: build a short DOM path string (used later to click the same card)
+        function getPath(el) {
+          const p = [];
+          let node = el;
+          while (node && p.length < 6) {
+            let label = node.tagName?.toLowerCase() || "div";
+            if (node.className) {
+              const cls = String(node.className).split(/\s+/).filter(Boolean)[0];
+              if (cls) label += "." + cls;
+            }
+            p.unshift(label);
+            node = node.parentElement;
+          }
+          return p.join(" > ");
+        }
+
+        // Dedup per page
+        const seen = new Set();
+        return out.filter((h) => {
+          const key = `${h.name.toLowerCase()}|${h.city.toLowerCase()}`;
+          if (seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        });
       }
-      return out;
-    });
+    );
+
+    return items;
   }
 
-  // First page (also triggers lazy content by scrolling once)
+  // Scroll a bit to trigger lazy load on first view
   for (let i = 0; i < 5; i++) {
     await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
     await page.waitForTimeout(300);
   }
 
   const results = [];
-  const seen = new Set();
-  function pushUnique(list) {
-    for (const h of list) {
-      const key = `${(h.name || "").toLowerCase()}|${(h.city || "").toLowerCase()}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      results.push(h);
-      if (results.length >= maxHotels) return true;
-    }
-    return false;
-  }
+  const seenGlobal = new Set();
 
-  // collect page 1
-  let cards = await extractCards();
-  pushUnique(cards);
+  // Collect first page
+  let pageItems = await extractCardsOnPage();
+  await maybeClickForUrls(page, pageItems, fetchUrls, settleMs);
+  pushUnique(pageItems);
 
-  // pagination loop (URL does NOT change)
+  // Paginate even if URL never changes
   for (let p = 2; p <= maxPages; p++) {
-    const prevCount = (await page.$$("//div[contains(@class,'sb_todays_deals_card_ctn')]")).length;
-    const firstNameBefore = cards[0]?.name || "";
+    const beforeFirst = pageItems[0]?.name || "";
+    const beforeCount = (await page.$$("[class*='deals_card_ctn'], [class*='explore_card_ctn']").catch(() => [])).length;
 
-    // Try common “next” targets (adjust if your markup differs)
     const nextLocators = [
       'button[aria-label="Next"]',
       'a[aria-label="Next"]',
@@ -92,78 +122,70 @@ export async function getSparrowHotels({ maxHotels = 800, maxPages = 50 } = {}) 
       if (await loc.count()) {
         try {
           await Promise.all([
-            // wait for DOM change, not URL change
             page.waitForFunction(
-              ({ prevCount, firstNameBefore }) => {
-                const cards = Array.from(
-                  document.querySelectorAll(".sb_todays_deals_card_ctn")
+              ({ beforeFirst, beforeCount }) => {
+                const cards = document.querySelectorAll(
+                  ".sb_todays_deals_card_ctn, .sb_explore_card_ctn, .sb_card, [class*='deals_card_ctn'], [class*='explore_card_ctn']"
                 );
-                if (cards.length > prevCount) return true;
-                const first = cards[0]
-                  ?.querySelector(".sb_todays_deals_card_heading")
-                  ?.textContent?.trim();
-                return first && first !== firstNameBefore;
+                if (cards.length > beforeCount) return true;
+                const firstName =
+                  cards[0]?.querySelector(".sb_todays_deals_card_heading, .sb_explore_card_heading, h1, h2, h3, h4")
+                    ?.textContent?.trim() || "";
+                return firstName && firstName !== beforeFirst;
               },
               { polling: 200, timeout: 8000 },
-              { prevCount, firstNameBefore }
+              { beforeFirst, beforeCount }
             ).catch(() => null),
             loc.first().click(),
           ]);
           clicked = true;
           break;
-        } catch {
-          // try next selector
-        }
+        } catch { /* try next */ }
       }
     }
+    if (!clicked) break;
 
-    // If no explicit "Next", try numbered buttons not marked active
-    if (!clicked) {
-      const numberButtons = page.locator(
-        'button[aria-current="false"], a[aria-current="false"], .pagination a, .pagination button'
-      );
-      const count = await numberButtons.count();
-      for (let i = 0; i < count; i++) {
-        const btn = numberButtons.nth(i);
-        const label = (await btn.innerText().catch(() => ""))?.trim();
-        if (!/^\d+$/.test(label)) continue; // only plain numbers
-        try {
-          await Promise.all([
-            page.waitForFunction(
-              ({ prevCount, firstNameBefore }) => {
-                const cards = Array.from(
-                  document.querySelectorAll(".sb_todays_deals_card_ctn")
-                );
-                if (cards.length > prevCount) return true;
-                const first = cards[0]
-                  ?.querySelector(".sb_todays_deals_card_heading")
-                  ?.textContent?.trim();
-                return first && first !== firstNameBefore;
-              },
-              { polling: 200, timeout: 8000 },
-              { prevCount, firstNameBefore }
-            ).catch(() => null),
-            btn.click(),
-          ]);
-          clicked = true;
-          break;
-        } catch {
-          // try next candidate
-        }
-      }
-    }
-
-    if (!clicked) break; // nothing clickable → stop
-
-    // small settle time for any images/widgets
-    await page.waitForTimeout(500);
-
-    // collect this page
-    cards = await extractCards();
-    const done = pushUnique(cards);
-    if (done) break;
+    await page.waitForTimeout(settleMs);
+    pageItems = await extractCardsOnPage();
+    await maybeClickForUrls(page, pageItems, fetchUrls, settleMs);
+    if (pushUnique(pageItems)) break;
   }
 
   await browser.close();
   return results;
+
+  function pushUnique(list) {
+    for (const h of list) {
+      const key = `${h.name.toLowerCase()}|${h.city.toLowerCase()}`;
+      if (seenGlobal.has(key)) continue;
+      seenGlobal.add(key);
+      results.push({ name: h.name, city: h.city, priceRaw: h.priceRaw, url: h.url });
+      if (results.length >= maxHotels) return true;
+    }
+    return false;
+  }
+}
+
+/** Click into a card to grab URL when there is no <a>. Then go back. */
+async function maybeClickForUrls(page, items, fetchUrls, settleMs) {
+  if (!fetchUrls) return;
+  for (const it of items) {
+    if (it.url) continue;
+    // try clicking its primary button or the card itself
+    const button = page.locator(`text=Bid or Book Now`).first();
+    try {
+      const old = page.url();
+      await Promise.all([
+        page.waitForNavigation({ waitUntil: "domcontentloaded", timeout: 10000 }).catch(() => null),
+        button.click().catch(() => page.mouse.click(10, 10).catch(() => null)), // fallback
+      ]);
+      await page.waitForTimeout(settleMs);
+      const newUrl = page.url();
+      if (newUrl && newUrl !== old) it.url = newUrl;
+      await page.goBack({ waitUntil: "domcontentloaded" }).catch(() => null);
+      await page.waitForTimeout(300);
+    } catch {
+      // ignore; leave url blank if we can't navigate
+    }
+  }
 }
