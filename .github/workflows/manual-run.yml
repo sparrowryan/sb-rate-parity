@@ -1,0 +1,52 @@
+name: Manual Rate Tracker (Fresh)
+on:
+  workflow_dispatch:  # run by hand only, no schedule yet
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # use install (no lockfile required)
+      - name: Install deps (fresh)
+        run: npm install
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps
+
+      # quick webhook test so we know the Sheet pipeline works
+      - name: Webhook smoke test
+        run: |
+          node -e "
+            import('node-fetch').then(({default:fetch}) =>
+              fetch(process.env.WEBHOOK_URL,{
+                method:'POST',
+                headers:{'Content-Type':'application/json'},
+                body:JSON.stringify({rows:[[
+                  new Date().toISOString().slice(0,10),
+                  '2025-11-07','2025-11-09',
+                  'Smoke Test Hotel','City',
+                  200,220,225,230,240,235,245,
+                  20,20/220,
+                  'https://sparrowbid.com',
+                  'https://google.com/travel/hotels'
+                ]]})
+              }).then(r=>r.text()).then(t=>console.log('Webhook response:',t)).catch(e=>{console.error(e);process.exit(1);})
+            );
+          "
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+
+      - name: Run scraper
+        run: node index.js
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          CHECKIN_OFFSET_DAYS: 7
+          NIGHTS: 2
