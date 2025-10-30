@@ -1,67 +1,100 @@
+// index.js
 import dayjs from "dayjs";
 import fetch from "node-fetch";
 import { getSparrowHotels } from "./scrapeSparrowBid.js";
 import { getGoogleHotelsPrices } from "./fetchGoogleHotels.js";
 
-const WEBHOOK = process.env.WEBHOOK_URL; // Apps Script Web App URL
+const WEBHOOK = process.env.WEBHOOK_URL;
 const CHECKIN_OFFSET_DAYS = Number(process.env.CHECKIN_OFFSET_DAYS || 7);
 const NIGHTS = Number(process.env.NIGHTS || 2);
 
-function n(x){ return (typeof x === "number" && isFinite(x)) ? x : ""; }
+// helpers
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
 
 (async () => {
-  const today = dayjs().format("YYYY-MM-DD");
-  
-// Fetch more pages with pagination support
-const hotels = await getSparrowHotels({
-  maxHotels: 600,   // how many total hotels you want to collect
-  maxPages: 40      // safety cap in case pagination is endless
-});
+  try {
+    if (!WEBHOOK || !/^https?:\/\//i.test(WEBHOOK)) {
+      throw new Error("WEBHOOK_URL is not set or invalid. Add it under Settings → Secrets → Actions.");
+    }
 
-console.log("Found hotels:", hotels.length);
-console.log("Sample hotels:", hotels.slice(0, 5));
+    // -------- SCRAPE SPARROWBID (with pagination + SB URL capture) --------
+    const hotels = await getSparrowHotels({
+      maxHotels: 600,   // total unique hotels to collect
+      maxPages: 40,     // safety cap for client-side pagination
+      fetchUrls: true,  // click into cards that lack <a> to capture SB URL
+      settleMs: 500
+    });
 
+    console.log("Found hotels:", hotels.length);
+    console.log("Sample hotels:", hotels.slice(0, 5));
 
-  const rows = [];
-  for (const h of hotels) {
-    const sbPrice = h.priceRaw ? Number(h.priceRaw.replace(/[^0-9.]/g,"")) : null;
-    const gh = await getGoogleHotelsPrices(h.name, h.city, { checkInOffsetDays: CHECKIN_OFFSET_DAYS, nights: NIGHTS });
+    if (!hotels.length) throw new Error("SparrowBid scraper returned 0 hotels. Check selectors.");
 
-    const candidates = [gh.google_best, gh.expedia, gh.booking, gh.hotels, gh.priceline, gh.travelocity]
-      .filter(v => typeof v === "number" && isFinite(v));
-    const minOta = candidates.length ? Math.min(...candidates) : null;
+    // -------- BUILD ROWS --------
+    const today = dayjs().format("YYYY-MM-DD");
+    const rows = [];
 
-    const adv$ = (sbPrice!=null && minOta!=null) ? (minOta - sbPrice) : null;
-    const advPct = (sbPrice!=null && minOta!=null && minOta>0) ? ((minOta - sbPrice)/minOta) : null;
+    for (const h of hotels) {
+      const sbPrice = h.priceRaw ? Number(h.priceRaw.replace(/[^0-9.]/g, "")) : null;
 
-    rows.push([
-      today,
-      gh.check_in,
-      gh.check_out,
-      h.name,
-      h.city || "",
-      n(sbPrice),
-      n(gh.google_best),
-      n(gh.expedia),
-      n(gh.booking),
-      n(gh.hotels),
-      n(gh.priceline),
-      n(gh.travelocity),
-      n(adv$),
-      advPct != null ? advPct : "",
-      h.url || "",
-      gh.url || ""
-    ]);
+      // Query Google Hotels for OTA prices
+      const gh = await getGoogleHotelsPrices(h.name, h.city, {
+        checkInOffsetDays: CHECKIN_OFFSET_DAYS,
+        nights: NIGHTS,
+      });
 
-    // polite pacing
-    await new Promise(r => setTimeout(r, 1200 + Math.floor(Math.random()*800)));
+      // candidates for min OTA comparison
+      const candidates = [
+        gh.google_best,
+        gh.expedia,
+        gh.booking,
+        gh.hotels,
+        gh.priceline,
+        gh.travelocity,
+      ].filter((v) => typeof v === "number" && isFinite(v));
+
+      const minOta = candidates.length ? Math.min(...candidates) : null;
+      const adv$ = sbPrice != null && minOta != null ? minOta - sbPrice : null;
+      const advPct =
+        sbPrice != null && minOta != null && minOta > 0 ? (minOta - sbPrice) / minOta : null;
+
+      rows.push([
+        today,               // Date
+        gh.check_in,         // Check-in
+        gh.check_out,        // Check-out
+        h.name,              // Property
+        h.city || "",        // City
+        num(sbPrice),        // SB Price
+        num(gh.google_best), // Google Best
+        num(gh.expedia),     // Expedia
+        num(gh.booking),     // Booking.com
+        num(gh.hotels),      // Hotels.com
+        num(gh.priceline),   // Priceline
+        num(gh.travelocity), // Travelocity
+        num(adv$),           // SB Advantage $
+        advPct != null ? advPct : "", // SB Advantage %
+        h.url || "",         // SB URL
+        gh.url || "",        // Google Hotels URL
+      ]);
+
+      // polite pacing between Google Hotels fetches
+      await sleep(1000 + Math.floor(Math.random() * 600));
+    }
+
+    // -------- SEND TO GOOGLE SHEET VIA WEBHOOK --------
+    const res = await fetch(WEBHOOK, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows }),
+    });
+    const text = await res.text();
+    console.log("Webhook HTTP", res.status, text);
+    if (!res.ok) throw new Error(`Webhook failed: ${res.status} ${text}`);
+
+  } catch (err) {
+    console.error("FATAL:", err && err.stack ? err.stack : err);
+    process.exit(1);
   }
-
-  const res = await fetch(WEBHOOK, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ rows })
-  });
-  const json = await res.json().catch(()=>({}));
-  console.log("Webhook result:", json);
 })();
+
