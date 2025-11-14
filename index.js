@@ -138,7 +138,6 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
 
       let gh = null;
 
-      // Get the single Google reference price for the SAME dates
       try {
         gh = await getGoogleHotelsPriceSimple(h.name, h.city, {
           checkIn: CHECK_IN_STR,
@@ -150,19 +149,18 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
           err && err.message ? err.message : err
         );
 
-        // SB-only row when Google fails completely
         rows.push([
-          today,         // Date
+          today,
           "",            // Check-in
           "",            // Check-out
-          h.name,        // Property
-          h.city || "",  // City
-          num(sbPrice),  // SB Price
+          h.name,
+          h.city || "",
+          num(sbPrice),
           "",            // Google Best
           "", "", "", "", "", "",   // OTA columns (unused)
           "", "",        // Advantage $ and %
-          sbUrl,         // SB URL
-          "",            // Google URL
+          sbUrl,
+          "",
         ]);
         continue;
       }
@@ -183,14 +181,13 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
         h.city || "",         // City
         num(sbPrice),         // SB Price
         num(googleBest),      // Google Best (single ref rate)
-        "", "", "", "", "", "",   // OTA columns intentionally blank
+        "", "", "", "", "", "",   // OTA columns blank
         num(adv$),            // SB Advantage $
         advPct != null ? advPct : "", // SB Advantage %
-        sbUrl,                // SB URL (search link)
-        gh.url || "",         // Google URL (search prices page)
+        sbUrl,                // SB URL
+        gh.url || "",         // Google URL
       ]);
 
-      // polite pacing between Google price fetches
       await sleep(1000 + Math.floor(Math.random() * 600));
     }
 
