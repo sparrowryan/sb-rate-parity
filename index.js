@@ -8,9 +8,76 @@ const WEBHOOK = process.env.WEBHOOK_URL;
 const CHECKIN_OFFSET_DAYS = Number(process.env.CHECKIN_OFFSET_DAYS || 7);
 const NIGHTS = Number(process.env.NIGHTS || 2);
 
+// webhook tuning
+const BATCH_SIZE = 20;      // how many rows per POST to Apps Script
+const MAX_RETRIES = 4;      // retry attempts per batch
+const BASE_DELAY_MS = 2000; // base delay for backoff (2s)
+
 // helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
+
+/**
+ * Post one chunk of rows to the Google Apps Script webhook,
+ * with retries on 429 / 5xx.
+ */
+async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
+  if (!rowsChunk.length) return;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    try {
+      console.log(
+        `Posting chunk ${chunkIndex}/${totalChunks} to webhook (rows: ${rowsChunk.length}, attempt: ${attempt})`
+      );
+
+      const res = await fetch(WEBHOOK, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ rows: rowsChunk }),
+      });
+
+      const text = await res.text();
+      console.log(
+        `Webhook response for chunk ${chunkIndex}: HTTP ${res.status}, body: ${text.slice(
+          0,
+          200
+        )}`
+      );
+
+      if (res.ok) {
+        // success
+        return;
+      }
+
+      // Retry only on 429 / 5xx
+      if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
+        const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+        console.warn(
+          `Chunk ${chunkIndex} got ${res.status}. Backing off for ${delay}ms before retry.`
+        );
+        await sleep(delay);
+        continue;
+      }
+
+      // Other status codes: log and give up on this chunk
+      console.error(
+        `Non-retriable webhook error for chunk ${chunkIndex}: ${res.status} ${text}`
+      );
+      return;
+    } catch (err) {
+      const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
+      console.error(
+        `Network error posting chunk ${chunkIndex} (attempt ${attempt}):`,
+        err && err.message ? err.message : err
+      );
+      await sleep(delay);
+    }
+  }
+
+  console.error(
+    `Chunk ${chunkIndex} failed after ${MAX_RETRIES} attempts. Skipping this chunk.`
+  );
+}
 
 (async () => {
   try {
@@ -24,7 +91,7 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
     //  SCRAPE SPARROWBID
     // ---------------------------------------------------------------------
     const hotels = await getSparrowHotels({
-      maxHotels: 600,
+      maxHotels: 100,
       maxPages: 40,
       fetchUrls: true,
       settleMs: 500,
@@ -63,14 +130,14 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
       } catch (err) {
         console.error(
           `OTA scrape failed for "${h.name}" – skipping OTA rates for this one:`,
-          err.message || err
+          err && err.message ? err.message : err
         );
 
         // Write SB-only row
         rows.push([
           today,         // Date
           "",            // Check-in (unknown)
-          "",            // Check-out
+          "",            // Check-out (unknown)
           h.name,        // Property
           h.city || "",  // City
           num(sbPrice),  // SB Price
@@ -129,21 +196,19 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
       await sleep(1000 + Math.floor(Math.random() * 600));
     }
 
-    // ---------------------------------------------------------------------
-    //  SEND TO GOOGLE SHEET
-    // ---------------------------------------------------------------------
-    const res = await fetch(WEBHOOK, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ rows }),
-    });
+    console.log(`Prepared ${rows.length} rows total.`);
 
-    const text = await res.text();
-    console.log("Webhook HTTP", res.status, text);
-
-    if (!res.ok) {
-      throw new Error(`Webhook failed: ${res.status} ${text}`);
+    // ---------------------------------------------------------------------
+    //  SEND TO GOOGLE SHEET IN BATCHES WITH RETRY
+    // ---------------------------------------------------------------------
+    const totalChunks = Math.ceil(rows.length / BATCH_SIZE);
+    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+      const chunkIndex = i / BATCH_SIZE + 1;
+      const chunk = rows.slice(i, i + BATCH_SIZE);
+      await postRowsChunk(chunk, chunkIndex, totalChunks);
     }
+
+    console.log("All chunks processed. Done.");
 
   } catch (err) {
     console.error("FATAL:", err && err.stack ? err.stack : err);
