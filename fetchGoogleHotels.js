@@ -27,11 +27,50 @@ export function makeGoogleSearchUrl(name, city, checkIn, checkOut) {
 }
 
 /**
- * Try to extract price directly from the hotel result card DOM.
- * We:
- *  - find cards (role=listitem etc)
- *  - locate the one whose title text matches the hotelName
- *  - inside that card, find the first "$XX ... night" (or just "$XX")
+ * DOM-based extraction: use the link whose aria-label mentions the hotel name
+ * and read the .qQOQpe price span inside it.
+ *
+ * For your OYO example, this matches:
+ *   <a aria-label="Prices starting from $44, OYO Hotel Orlando Airport"> ... <span class="qQOQpe">$44</span>
+ */
+async function extractPriceFromAriaLink(page, hotelName) {
+  return await page.evaluate((hotelNameInner) => {
+    if (!hotelNameInner) return null;
+
+    const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const target = norm(hotelNameInner);
+
+    const anchors = Array.from(document.querySelectorAll('a[aria-label]'));
+
+    for (const a of anchors) {
+      const label = a.getAttribute("aria-label") || "";
+      const labelNorm = norm(label);
+      if (!labelNorm.includes(target) && !target.includes(labelNorm)) continue;
+
+      // Within this link, find the main price span
+      const priceSpan =
+        a.querySelector(".qQOQpe") ||
+        a.querySelector("span") ||
+        a.querySelector("div");
+
+      const text = (priceSpan?.textContent || "").trim();
+      if (!/\$\s?\d/.test(text)) continue;
+
+      const m = text.match(/\$\s?(\d[\d,]*)/);
+      if (!m) continue;
+
+      const num = Number(m[1].replace(/,/g, ""));
+      if (!isFinite(num)) continue;
+
+      return num;
+    }
+
+    return null;
+  }, hotelName);
+}
+
+/**
+ * Previous card-based method (kept as a secondary DOM strategy).
  */
 async function extractPriceFromCard(page, hotelName) {
   return await page.evaluate((hotelNameInner) => {
@@ -40,13 +79,11 @@ async function extractPriceFromCard(page, hotelName) {
     const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
     const target = norm(hotelNameInner);
 
-    // Candidate selectors for hotel cards
     const cardNodes = Array.from(
       document.querySelectorAll('[role="listitem"], div[jscontroller]')
     );
 
     for (const card of cardNodes) {
-      // Try a few possible title elements inside the card
       const titleEl =
         card.querySelector("h2") ||
         card.querySelector("h3") ||
@@ -57,11 +94,8 @@ async function extractPriceFromCard(page, hotelName) {
       if (!titleText) continue;
 
       const tNorm = norm(titleText);
-
-      // Require some overlap; allow partial match either way
       if (!tNorm.includes(target) && !target.includes(tNorm)) continue;
 
-      // Now find price text inside this card
       const textEls = Array.from(card.querySelectorAll("span, div"));
       const priceTexts = textEls
         .map((el) => el.innerText || el.textContent || "")
@@ -70,7 +104,6 @@ async function extractPriceFromCard(page, hotelName) {
 
       if (!priceTexts.length) continue;
 
-      // Prefer entries that mention "night" (e.g., "$44 per night")
       const withNight = priceTexts.filter((t) => /night/i.test(t));
       const chosen = withNight.length ? withNight[0] : priceTexts[0];
 
@@ -88,7 +121,7 @@ async function extractPriceFromCard(page, hotelName) {
 }
 
 /**
- * Fallback: body-text based extraction, scanning around the hotel name.
+ * Very last-resort fallback: body-text based extraction.
  */
 function extractReferencePriceFromBody(text, hotelName) {
   if (!text) return null;
@@ -104,15 +137,13 @@ function extractReferencePriceFromBody(text, hotelName) {
 
   const window = full.slice(startIndex, startIndex + 2000);
   const m = window.match(/\$\s?(\d[\d,]*)\s*(?:per\s*night|\/\s*night)?/i)
-    || window.match(/\$\s?(\d[\d,]*)/); // last-resort, just first $
+    || window.match(/\$\s?(\d[\d,]*)/);
 
   return m ? dollarsToNumber(m[0]) : null;
 }
 
 /**
  * Get ONE Google reference nightly price for a hotel for a specific date range.
- * - Takes explicit checkIn/checkOut strings ("YYYY-MM-DD")
- * - Returns { check_in, check_out, url, google_best }
  */
 export async function getGoogleHotelsPriceSimple(
   hotelName,
@@ -131,7 +162,7 @@ export async function getGoogleHotelsPriceSimple(
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
 
-    // Let dates & prices stabilize (avoid "flash" prices)
+    // Let dates & prices stabilize
     await page.waitForTimeout(5000);
 
     // Scroll to trigger lazy load of price components
@@ -140,16 +171,23 @@ export async function getGoogleHotelsPriceSimple(
       await page.waitForTimeout(800);
     }
 
-    // Extra settle time for late-updating prices
     await page.waitForTimeout(3000);
 
-    // 1) Try DOM-based card extraction (what you see visually)
-    let google_best = await extractPriceFromCard(page, hotelName);
+    // 1) Try the aria-label link strategy (should hit for OYO)
+    let google_best = await extractPriceFromAriaLink(page, hotelName);
+    console.log("[Google] aria-link price for", hotelName, "=", google_best);
 
-    // 2) Fallback to body-text method if needed
+    // 2) Try the older card strategy
+    if (google_best == null) {
+      google_best = await extractPriceFromCard(page, hotelName);
+      console.log("[Google] card price for", hotelName, "=", google_best);
+    }
+
+    // 3) Last resort: body text
     if (google_best == null) {
       const bodyText = await page.evaluate(() => document.body.innerText || "");
       google_best = extractReferencePriceFromBody(bodyText, hotelName);
+      console.log("[Google] body fallback price for", hotelName, "=", google_best);
     }
 
     return {
