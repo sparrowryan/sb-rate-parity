@@ -7,39 +7,63 @@ function dollarsToNumber(s) {
   return m ? Number(m[1].replace(/,/g, "")) : null;
 }
 
+// Clean city text (drop “mi away”, keep just the city/region part)
+function cleanCity(cityRaw) {
+  if (!cityRaw) return "";
+  let c = String(cityRaw);
+  // "New York, US - 5385.12 mi away" → "New York, US"
+  c = c.split(" - ")[0];
+  return c.trim();
+}
+
+// Build Google Travel search URL with explicit dates
 export function makeGoogleSearchUrl(name, city, checkIn, checkOut) {
-  const q = encodeURIComponent([name, city].filter(Boolean).join(" "));
+  const qParts = [];
+  if (name) qParts.push(name);
+  const cityClean = cleanCity(city);
+  if (cityClean) qParts.push(cityClean);
+  const q = encodeURIComponent(qParts.join(" "));
   return `https://www.google.com/travel/search?hl=en&gl=us&q=${q}&checkin=${checkIn}&checkout=${checkOut}`;
 }
 
-function extractBrandPrices(text) {
-  const brands = ["Expedia", "Booking.com", "Hotels.com", "Priceline", "Travelocity"];
-  const out = {};
+/**
+ * Extract a single "reference" nightly price by:
+ *  - finding the first occurrence of the hotel name in body text (if present)
+ *  - scanning the next ~2000 characters for the first "$123" (optionally "per night")
+ */
+function extractReferencePrice(text, hotelName) {
+  if (!text) return null;
 
-  for (const brand of brands) {
-    // Look up to ~80 characters after the brand for the first $price
-    const re = new RegExp(
-      `${brand}[\\s\\S]{0,80}?\\$\\s?(\\d[\\d,]*)`,
-      "i"
-    );
-    const m = text.match(re);
-    if (m) {
-      out[brand.toLowerCase()] = dollarsToNumber(m[1]);
-    }
+  const full = String(text);
+  const lower = full.toLowerCase();
+  const target = String(hotelName || "").toLowerCase().trim();
+
+  // Start scanning near the hotel name if we can find it, otherwise from top
+  let startIndex = 0;
+  if (target && lower.includes(target)) {
+    startIndex = lower.indexOf(target);
   }
 
-  return out;
+  const window = full.slice(startIndex, startIndex + 2000);
+  const m = window.match(/\$\s?(\d[\d,]*)\s*(?:per\s*night|\/\s*night)?/i);
+  return m ? dollarsToNumber(m[0]) : null;
 }
 
-export async function getGoogleHotelsPrices(
+/**
+ * Get ONE Google reference nightly price for a hotel for a specific date range.
+ * - Takes explicit checkIn/checkOut strings ("YYYY-MM-DD")
+ * - Returns { check_in, check_out, url, google_best }
+ */
+export async function getGoogleHotelsPriceSimple(
   hotelName,
   city,
-  { checkInOffsetDays = 7, nights = 2 } = {}
+  { checkIn, checkOut }
 ) {
-  const check_in = dayjs().add(checkInOffsetDays, "day").format("YYYY-MM-DD");
-  const check_out = dayjs().add(checkInOffsetDays + nights, "day").format("YYYY-MM-DD");
+  if (!checkIn || !checkOut) {
+    throw new Error("getGoogleHotelsPriceSimple: checkIn and checkOut are required");
+  }
 
-  const url = makeGoogleSearchUrl(hotelName, city, check_in, check_out);
+  const url = makeGoogleSearchUrl(hotelName, city, checkIn, checkOut);
 
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
@@ -47,43 +71,28 @@ export async function getGoogleHotelsPrices(
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
 
-    // Let prices load and scroll a bit so lazy content appears
-    await page.waitForTimeout(2500);
-    for (let i = 0; i < 3; i++) {
+    // Let dates & prices stabilize (avoid "flash" prices)
+    await page.waitForTimeout(5000);
+
+    // Scroll to trigger lazy load of price components
+    for (let i = 0; i < 4; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
-      await page.waitForTimeout(600);
+      await page.waitForTimeout(800);
     }
 
+    // Extra settle time for late-updating prices
+    await page.waitForTimeout(3000);
+
     const bodyText = await page.evaluate(() => document.body.innerText || "");
-    const pairs = extractBrandPrices(bodyText);
-
-    // Map to the columns we care about
-    const expedia = pairs["expedia"] ?? null;
-    const booking = pairs["booking.com"] ?? pairs["booking"] ?? null;
-    const hotels = pairs["hotels.com"] ?? pairs["hotels"] ?? null;
-    const priceline = pairs["priceline"] ?? null;
-    const travelocity = pairs["travelocity"] ?? null;
-
-    const otaValues = [expedia, booking, hotels, priceline, travelocity].filter(
-      (v) => typeof v === "number" && isFinite(v)
-    );
-
-    // Define google_best as the min OTA rate when possible (more stable)
-    const google_best = otaValues.length ? Math.min(...otaValues) : null;
+    const google_best = extractReferencePrice(bodyText, hotelName);
 
     return {
-      check_in,
-      check_out,
-      url,          // search "prices" URL
+      check_in: checkIn,
+      check_out: checkOut,
+      url,
       google_best,
-      expedia,
-      booking,
-      hotels,
-      priceline,
-      travelocity,
     };
   } finally {
     await browser.close();
   }
 }
-
