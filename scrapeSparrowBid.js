@@ -1,10 +1,53 @@
+// scrapeSparrowBid.js
 import { chromium } from "playwright";
 
-export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) {
+/**
+ * Scrape SparrowBid Explore with client-side pagination,
+ * for a specific check-in / check-out date window.
+ *
+ * checkIn / checkOut must be "YYYY-MM-DD" strings.
+ */
+export async function getSparrowHotels({
+  maxHotels = 100,
+  maxPages = 40,
+  checkIn,
+  checkOut,
+} = {}) {
+  if (!checkIn || !checkOut) {
+    throw new Error("getSparrowHotels: checkIn and checkOut are required");
+  }
+
+  // Build the same filters object SparrowBid uses in the URL
+  const filtersObj = {
+    check_in_date: `${checkIn}T06:00:00.000Z`,
+    check_out_date: `${checkOut}T06:00:00.000Z`,
+    dateRange: "Exact dates",
+    adults: 2,
+    child: 0,
+    place: {
+      geoLocation: { lat: "", lng: "" },
+      address_1: "",
+      city: "",
+      state: "",
+      country: "",
+      zip: "",
+      label: "",
+    },
+    page: 1,
+  };
+
+  // SparrowBid URL encodes this JSON twice (as you saw in your example URL)
+  const filtersJson = JSON.stringify(filtersObj);
+  const onceEncoded = encodeURIComponent(filtersJson);
+  const twiceEncoded = encodeURIComponent(onceEncoded);
+
+  const url = `https://www.sparrowbid.com/explore?filters=${twiceEncoded}`;
+  console.log("Loading SparrowBid Explore URL:", url);
+
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
 
-  await page.goto("https://www.sparrowbid.com/explore", {
+  await page.goto(url, {
     waitUntil: "networkidle",
     timeout: 120000,
   });
@@ -27,7 +70,6 @@ export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) 
         );
         if (!name) continue;
 
-        // Example: "New York, US - 5385.12 mi away" → "New York, US"
         const cityLine = clean(
           card.querySelector(".sb_todays_deals_card_country_ctn p")
             ?.textContent
@@ -42,7 +84,7 @@ export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) 
           name,
           city,
           priceRaw,
-          url: "", // cards don't expose a direct link; we can add click-through later if needed
+          url: "", // we'll synthesize a URL in index.js
         });
       }
       return out;
@@ -109,7 +151,7 @@ export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) 
         clicked = true;
         break;
       } catch {
-        // try next button if this one fails
+        // try next button
       }
     }
 
@@ -118,7 +160,6 @@ export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) 
       break;
     }
 
-    // small settle time for the new page of cards
     await page.waitForTimeout(800);
 
     cards = await extractCards();
@@ -130,3 +171,4 @@ export async function getSparrowHotels({ maxHotels = 600, maxPages = 40 } = {}) 
   await browser.close();
   return results;
 }
+
