@@ -27,25 +27,85 @@ export function makeGoogleSearchUrl(name, city, checkIn, checkOut) {
 }
 
 /**
- * Extract a single "reference" nightly price by:
- *  - finding the first occurrence of the hotel name in body text (if present)
- *  - scanning the next ~2000 characters for the first "$123" (optionally "per night")
+ * Try to extract price directly from the hotel result card DOM.
+ * We:
+ *  - find cards (role=listitem etc)
+ *  - locate the one whose title text matches the hotelName
+ *  - inside that card, find the first "$XX ... night" (or just "$XX")
  */
-function extractReferencePrice(text, hotelName) {
+async function extractPriceFromCard(page, hotelName) {
+  return await page.evaluate((hotelNameInner) => {
+    if (!hotelNameInner) return null;
+
+    const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const target = norm(hotelNameInner);
+
+    // Candidate selectors for hotel cards
+    const cardNodes = Array.from(
+      document.querySelectorAll('[role="listitem"], div[jscontroller]')
+    );
+
+    for (const card of cardNodes) {
+      // Try a few possible title elements inside the card
+      const titleEl =
+        card.querySelector("h2") ||
+        card.querySelector("h3") ||
+        card.querySelector('span[aria-level="2"]') ||
+        card.querySelector("a span");
+
+      const titleText = titleEl?.innerText || titleEl?.textContent || "";
+      if (!titleText) continue;
+
+      const tNorm = norm(titleText);
+
+      // Require some overlap; allow partial match either way
+      if (!tNorm.includes(target) && !target.includes(tNorm)) continue;
+
+      // Now find price text inside this card
+      const textEls = Array.from(card.querySelectorAll("span, div"));
+      const priceTexts = textEls
+        .map((el) => el.innerText || el.textContent || "")
+        .map((t) => t.replace(/\s+/g, " ").trim())
+        .filter((t) => /\$\s?\d/.test(t));
+
+      if (!priceTexts.length) continue;
+
+      // Prefer entries that mention "night" (e.g., "$44 per night")
+      const withNight = priceTexts.filter((t) => /night/i.test(t));
+      const chosen = withNight.length ? withNight[0] : priceTexts[0];
+
+      const m = chosen.match(/\$\s?(\d[\d,]*)/);
+      if (!m) continue;
+
+      const num = Number(m[1].replace(/,/g, ""));
+      if (!isFinite(num)) continue;
+
+      return num;
+    }
+
+    return null;
+  }, hotelName);
+}
+
+/**
+ * Fallback: body-text based extraction, scanning around the hotel name.
+ */
+function extractReferencePriceFromBody(text, hotelName) {
   if (!text) return null;
 
   const full = String(text);
   const lower = full.toLowerCase();
   const target = String(hotelName || "").toLowerCase().trim();
 
-  // Start scanning near the hotel name if we can find it, otherwise from top
   let startIndex = 0;
   if (target && lower.includes(target)) {
     startIndex = lower.indexOf(target);
   }
 
   const window = full.slice(startIndex, startIndex + 2000);
-  const m = window.match(/\$\s?(\d[\d,]*)\s*(?:per\s*night|\/\s*night)?/i);
+  const m = window.match(/\$\s?(\d[\d,]*)\s*(?:per\s*night|\/\s*night)?/i)
+    || window.match(/\$\s?(\d[\d,]*)/); // last-resort, just first $
+
   return m ? dollarsToNumber(m[0]) : null;
 }
 
@@ -83,8 +143,14 @@ export async function getGoogleHotelsPriceSimple(
     // Extra settle time for late-updating prices
     await page.waitForTimeout(3000);
 
-    const bodyText = await page.evaluate(() => document.body.innerText || "");
-    const google_best = extractReferencePrice(bodyText, hotelName);
+    // 1) Try DOM-based card extraction (what you see visually)
+    let google_best = await extractPriceFromCard(page, hotelName);
+
+    // 2) Fallback to body-text method if needed
+    if (google_best == null) {
+      const bodyText = await page.evaluate(() => document.body.innerText || "");
+      google_best = extractReferencePriceFromBody(bodyText, hotelName);
+    }
 
     return {
       check_in: checkIn,
@@ -96,3 +162,4 @@ export async function getGoogleHotelsPriceSimple(
     await browser.close();
   }
 }
+
