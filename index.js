@@ -15,36 +15,77 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
 (async () => {
   try {
     if (!WEBHOOK || !/^https?:\/\//i.test(WEBHOOK)) {
-      throw new Error("WEBHOOK_URL is not set or invalid. Add it under Settings → Secrets → Actions.");
+      throw new Error(
+        "WEBHOOK_URL is not set or invalid. Add it under Settings → Secrets → Actions."
+      );
     }
 
-    // -------- SCRAPE SPARROWBID (with pagination + SB URL capture) --------
+    // ---------------------------------------------------------------------
+    //  SCRAPE SPARROWBID
+    // ---------------------------------------------------------------------
     const hotels = await getSparrowHotels({
-      maxHotels: 600,   // total unique hotels to collect
-      maxPages: 40,     // safety cap for client-side pagination
-      fetchUrls: true,  // click into cards that lack <a> to capture SB URL
-      settleMs: 500
+      maxHotels: 600,
+      maxPages: 40,
+      fetchUrls: true,
+      settleMs: 500,
     });
 
     console.log("Found hotels:", hotels.length);
-    console.log("Sample hotels:", hotels.slice(0, 5));
+    console.log("Sample:", hotels.slice(0, 5));
 
-    if (!hotels.length) throw new Error("SparrowBid scraper returned 0 hotels. Check selectors.");
+    if (!hotels.length)
+      throw new Error(
+        "SparrowBid scraper returned 0 hotels. Check selectors / pagination."
+      );
 
-    // -------- BUILD ROWS --------
+    // ---------------------------------------------------------------------
+    //  BUILD ROWS
+    // ---------------------------------------------------------------------
     const today = dayjs().format("YYYY-MM-DD");
     const rows = [];
 
     for (const h of hotels) {
-      const sbPrice = h.priceRaw ? Number(h.priceRaw.replace(/[^0-9.]/g, "")) : null;
+      const sbPrice =
+        h.priceRaw && typeof h.priceRaw === "string"
+          ? Number(h.priceRaw.replace(/[^0-9.]/g, ""))
+          : null;
 
-      // Query Google Hotels for OTA prices
-      const gh = await getGoogleHotelsPrices(h.name, h.city, {
-        checkInOffsetDays: CHECKIN_OFFSET_DAYS,
-        nights: NIGHTS,
-      });
+      let gh = null;
 
-      // candidates for min OTA comparison
+      // ---------------------------------------------------------
+      // Try OTA scrape per-hotel with fail-soft behavior
+      // ---------------------------------------------------------
+      try {
+        gh = await getGoogleHotelsPrices(h.name, h.city, {
+          checkInOffsetDays: CHECKIN_OFFSET_DAYS,
+          nights: NIGHTS,
+        });
+      } catch (err) {
+        console.error(
+          `OTA scrape failed for "${h.name}" – skipping OTA rates for this one:`,
+          err.message || err
+        );
+
+        // Write SB-only row
+        rows.push([
+          today,         // Date
+          "",            // Check-in (unknown)
+          "",            // Check-out
+          h.name,        // Property
+          h.city || "",  // City
+          num(sbPrice),  // SB Price
+          "", "", "", "", "", "",   // OTA columns blank
+          "", "",        // Advantage $ and %
+          h.url || "",   // SB URL
+          "",            // OTA URL
+        ]);
+
+        continue; // move to next hotel, do NOT kill the run
+      }
+
+      // ---------------------------------------------------------
+      // Compute OTA min + advantage
+      // ---------------------------------------------------------
       const candidates = [
         gh.google_best,
         gh.expedia,
@@ -55,10 +96,16 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
       ].filter((v) => typeof v === "number" && isFinite(v));
 
       const minOta = candidates.length ? Math.min(...candidates) : null;
-      const adv$ = sbPrice != null && minOta != null ? minOta - sbPrice : null;
+      const adv$ =
+        sbPrice != null && minOta != null ? minOta - sbPrice : null;
       const advPct =
-        sbPrice != null && minOta != null && minOta > 0 ? (minOta - sbPrice) / minOta : null;
+        sbPrice != null && minOta != null && minOta > 0
+          ? (minOta - sbPrice) / minOta
+          : null;
 
+      // ---------------------------------------------------------
+      // Add FULL row (SB + OTA)
+      // ---------------------------------------------------------
       rows.push([
         today,               // Date
         gh.check_in,         // Check-in
@@ -66,7 +113,7 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
         h.name,              // Property
         h.city || "",        // City
         num(sbPrice),        // SB Price
-        num(gh.google_best), // Google Best
+        num(gh.google_best), // Google Best (min OTA)
         num(gh.expedia),     // Expedia
         num(gh.booking),     // Booking.com
         num(gh.hotels),      // Hotels.com
@@ -75,26 +122,31 @@ const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
         num(adv$),           // SB Advantage $
         advPct != null ? advPct : "", // SB Advantage %
         h.url || "",         // SB URL
-        gh.url || "",        // Google Hotels URL
+        gh.url || "",        // OTA URL (Google search prices page)
       ]);
 
-      // polite pacing between Google Hotels fetches
+      // polite pacing between Google price fetches
       await sleep(1000 + Math.floor(Math.random() * 600));
     }
 
-    // -------- SEND TO GOOGLE SHEET VIA WEBHOOK --------
+    // ---------------------------------------------------------------------
+    //  SEND TO GOOGLE SHEET
+    // ---------------------------------------------------------------------
     const res = await fetch(WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ rows }),
     });
+
     const text = await res.text();
     console.log("Webhook HTTP", res.status, text);
-    if (!res.ok) throw new Error(`Webhook failed: ${res.status} ${text}`);
+
+    if (!res.ok) {
+      throw new Error(`Webhook failed: ${res.status} ${text}`);
+    }
 
   } catch (err) {
     console.error("FATAL:", err && err.stack ? err.stack : err);
     process.exit(1);
   }
 })();
-
