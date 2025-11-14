@@ -2,20 +2,32 @@
 import dayjs from "dayjs";
 import fetch from "node-fetch";
 import { getSparrowHotels } from "./scrapeSparrowBid.js";
-import { getGoogleHotelsPrices } from "./fetchGoogleHotels.js";
+import { getGoogleHotelsPriceSimple } from "./fetchGoogleHotels.js";
 
 const WEBHOOK = process.env.WEBHOOK_URL;
 const CHECKIN_OFFSET_DAYS = Number(process.env.CHECKIN_OFFSET_DAYS || 7);
 const NIGHTS = Number(process.env.NIGHTS || 2);
 
 // webhook tuning
-const BATCH_SIZE = 20;      // how many rows per POST to Apps Script
-const MAX_RETRIES = 4;      // retry attempts per batch
-const BASE_DELAY_MS = 2000; // base delay for backoff (2s)
+const BATCH_SIZE = 20;
+const MAX_RETRIES = 4;
+const BASE_DELAY_MS = 2000;
 
 // helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
+
+/**
+ * Construct a "good enough" SparrowBid URL that lands on a search
+ * for this hotel + city.
+ */
+function makeSparrowBidUrl(name, city) {
+  const parts = [];
+  if (name) parts.push(name);
+  if (city) parts.push(city);
+  const q = encodeURIComponent(parts.join(" "));
+  return `https://www.sparrowbid.com/explore?search=${q}`;
+}
 
 /**
  * Post one chunk of rows to the Google Apps Script webhook,
@@ -44,12 +56,8 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
         )}`
       );
 
-      if (res.ok) {
-        // success
-        return;
-      }
+      if (res.ok) return;
 
-      // Retry only on 429 / 5xx
       if (res.status === 429 || (res.status >= 500 && res.status < 600)) {
         const delay = BASE_DELAY_MS * Math.pow(2, attempt - 1);
         console.warn(
@@ -59,7 +67,6 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
         continue;
       }
 
-      // Other status codes: log and give up on this chunk
       console.error(
         `Non-retriable webhook error for chunk ${chunkIndex}: ${res.status} ${text}`
       );
@@ -88,13 +95,23 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
     }
 
     // ---------------------------------------------------------------------
-    //  SCRAPE SPARROWBID
+    //  Compute one shared date window for SB + Google
+    // ---------------------------------------------------------------------
+    const checkInDate = dayjs().add(CHECKIN_OFFSET_DAYS, "day");
+    const checkOutDate = dayjs().add(CHECKIN_OFFSET_DAYS + NIGHTS, "day");
+    const CHECK_IN_STR = checkInDate.format("YYYY-MM-DD");
+    const CHECK_OUT_STR = checkOutDate.format("YYYY-MM-DD");
+
+    console.log("Using date window:", CHECK_IN_STR, "to", CHECK_OUT_STR);
+
+    // ---------------------------------------------------------------------
+    //  SCRAPE SPARROWBID (LIMIT TO 100 HOTELS)
     // ---------------------------------------------------------------------
     const hotels = await getSparrowHotels({
       maxHotels: 100,
       maxPages: 40,
-      fetchUrls: true,
-      settleMs: 500,
+      checkIn: CHECK_IN_STR,
+      checkOut: CHECK_OUT_STR,
     });
 
     console.log("Found hotels:", hotels.length);
@@ -117,79 +134,60 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
           ? Number(h.priceRaw.replace(/[^0-9.]/g, ""))
           : null;
 
+      const sbUrl = makeSparrowBidUrl(h.name, h.city);
+
       let gh = null;
 
-      // ---------------------------------------------------------
-      // Try OTA scrape per-hotel with fail-soft behavior
-      // ---------------------------------------------------------
+      // Get the single Google reference price for the SAME dates
       try {
-        gh = await getGoogleHotelsPrices(h.name, h.city, {
-          checkInOffsetDays: CHECKIN_OFFSET_DAYS,
-          nights: NIGHTS,
+        gh = await getGoogleHotelsPriceSimple(h.name, h.city, {
+          checkIn: CHECK_IN_STR,
+          checkOut: CHECK_OUT_STR,
         });
       } catch (err) {
         console.error(
-          `OTA scrape failed for "${h.name}" – skipping OTA rates for this one:`,
+          `Google price scrape failed for "${h.name}" – SB-only row:`,
           err && err.message ? err.message : err
         );
 
-        // Write SB-only row
+        // SB-only row when Google fails completely
         rows.push([
           today,         // Date
-          "",            // Check-in (unknown)
-          "",            // Check-out (unknown)
+          "",            // Check-in
+          "",            // Check-out
           h.name,        // Property
           h.city || "",  // City
           num(sbPrice),  // SB Price
-          "", "", "", "", "", "",   // OTA columns blank
+          "",            // Google Best
+          "", "", "", "", "", "",   // OTA columns (unused)
           "", "",        // Advantage $ and %
-          h.url || "",   // SB URL
-          "",            // OTA URL
+          sbUrl,         // SB URL
+          "",            // Google URL
         ]);
-
-        continue; // move to next hotel, do NOT kill the run
+        continue;
       }
 
-      // ---------------------------------------------------------
-      // Compute OTA min + advantage
-      // ---------------------------------------------------------
-      const candidates = [
-        gh.google_best,
-        gh.expedia,
-        gh.booking,
-        gh.hotels,
-        gh.priceline,
-        gh.travelocity,
-      ].filter((v) => typeof v === "number" && isFinite(v));
-
-      const minOta = candidates.length ? Math.min(...candidates) : null;
+      const googleBest = gh?.google_best ?? null;
       const adv$ =
-        sbPrice != null && minOta != null ? minOta - sbPrice : null;
+        sbPrice != null && googleBest != null ? googleBest - sbPrice : null;
       const advPct =
-        sbPrice != null && minOta != null && minOta > 0
-          ? (minOta - sbPrice) / minOta
+        sbPrice != null && googleBest != null && googleBest > 0
+          ? (googleBest - sbPrice) / googleBest
           : null;
 
-      // ---------------------------------------------------------
-      // Add FULL row (SB + OTA)
-      // ---------------------------------------------------------
       rows.push([
-        today,               // Date
-        gh.check_in,         // Check-in
-        gh.check_out,        // Check-out
-        h.name,              // Property
-        h.city || "",        // City
-        num(sbPrice),        // SB Price
-        num(gh.google_best), // Google Best (min OTA)
-        num(gh.expedia),     // Expedia
-        num(gh.booking),     // Booking.com
-        num(gh.hotels),      // Hotels.com
-        num(gh.priceline),   // Priceline
-        num(gh.travelocity), // Travelocity
-        num(adv$),           // SB Advantage $
+        today,                // Date
+        gh.check_in,          // Check-in
+        gh.check_out,         // Check-out
+        h.name,               // Property
+        h.city || "",         // City
+        num(sbPrice),         // SB Price
+        num(googleBest),      // Google Best (single ref rate)
+        "", "", "", "", "", "",   // OTA columns intentionally blank
+        num(adv$),            // SB Advantage $
         advPct != null ? advPct : "", // SB Advantage %
-        h.url || "",         // SB URL
-        gh.url || "",        // OTA URL (Google search prices page)
+        sbUrl,                // SB URL (search link)
+        gh.url || "",         // Google URL (search prices page)
       ]);
 
       // polite pacing between Google price fetches
@@ -199,7 +197,7 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
     console.log(`Prepared ${rows.length} rows total.`);
 
     // ---------------------------------------------------------------------
-    //  SEND TO GOOGLE SHEET IN BATCHES WITH RETRY
+    //  SEND TO GOOGLE SHEET IN BATCHES
     // ---------------------------------------------------------------------
     const totalChunks = Math.ceil(rows.length / BATCH_SIZE);
     for (let i = 0; i < rows.length; i += BATCH_SIZE) {
@@ -215,3 +213,4 @@ async function postRowsChunk(rowsChunk, chunkIndex, totalChunks) {
     process.exit(1);
   }
 })();
+
