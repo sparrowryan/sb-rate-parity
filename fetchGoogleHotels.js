@@ -7,39 +7,31 @@ function dollarsToNumber(s) {
   return m ? Number(m[1].replace(/,/g, "")) : null;
 }
 
-// Clean city text (drop “mi away”, keep just the city/region part)
-function cleanCity(cityRaw) {
-  if (!cityRaw) return "";
-  let c = String(cityRaw);
-  // "New York, US - 5385.12 mi away" → "New York, US"
-  c = c.split(" - ")[0];
-  return c.trim();
-}
-
-// Build a Google Travel search URL WITHOUT trusting dates
-export function makeGoogleSearchUrl(name, city) {
-  const qParts = [];
-  if (name) qParts.push(name);
-  const cityClean = cleanCity(city);
-  if (cityClean) qParts.push(cityClean);
-  const q = encodeURIComponent(qParts.join(" "));
+// Build a Google Travel search URL using ONLY the hotel name.
+// City is intentionally ignored here to reduce name mismatch issues.
+export function makeGoogleSearchUrl(name, _city) {
+  const q = encodeURIComponent(String(name || "").trim());
   return `https://www.google.com/travel/search?hl=en&gl=us&q=${q}`;
 }
 
 /**
- * Use the actual Google date picker to set the desired check-in/check-out.
- * This avoids Google silently overriding or ignoring URL date params.
+ * Use the Google date picker UI to set the desired check-in/check-out.
+ * We match calendar cells by the full aria-label you showed, e.g.:
+ *  "Friday, November 21, 2025, departure date."
+ *  "Sunday, November 23, 2025, return date."
  */
 async function setDateRangeInUi(page, checkIn, checkOut) {
-  const checkInLabel = dayjs(checkIn).format("dddd, MMMM D, YYYY");   // e.g. "Friday, November 21, 2025"
-  const checkOutLabel = dayjs(checkOut).format("dddd, MMMM D, YYYY"); // e.g. "Sunday, November 23, 2025"
+  const checkInLabel =
+    dayjs(checkIn).format("dddd, MMMM D, YYYY") + ", departure date.";
+  const checkOutLabel =
+    dayjs(checkOut).format("dddd, MMMM D, YYYY") + ", return date.";
 
-  // 1) Open date picker (button/element with "Check-in" in aria-label or text)
+  // 1) Open date picker by clicking the check-in input
   const openSelectors = [
+    'input[aria-label="Check-in"]',
+    'input[placeholder="Check-in"]',
     'button[aria-label*="Check-in"]',
-    'button[aria-label*="Check in"]',
     '[role="button"][aria-label*="Check-in"]',
-    '[role="button"]:has-text("Check-in")',
   ];
 
   let opened = false;
@@ -54,18 +46,17 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
 
   if (!opened) {
     console.warn("[Google] Could not find date picker opener; dates may default.");
-    return;
+    return false;
   }
 
-  // Small delay for calendar to render
   await page.waitForTimeout(1000);
 
-  // Helper to click a date cell by aria-label substring
-  async function clickDateByLabel(labelText) {
-    const selector = `[role="gridcell"][aria-label*="${labelText}"]`;
+  // Helper to click a date cell by exact aria-label match on the date div
+  async function clickDateByLabel(label) {
+    const selector = `div[jsname="nEWxA"][aria-label="${label}"]`;
     const cell = await page.$(selector);
     if (!cell) {
-      console.warn("[Google] Could not find date cell for:", labelText);
+      console.warn("[Google] Could not find date cell for label:", label);
       return false;
     }
     await cell.click();
@@ -93,12 +84,21 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   // Wait for prices to refresh after date change
   await page.waitForTimeout(4000);
 
-  console.log("[Google] Date range set in UI to", checkInLabel, "→", checkOutLabel, "success:", okIn && okOut);
+  const success = okIn && okOut;
+  console.log(
+    "[Google] Date range set in UI to",
+    checkInLabel,
+    "→",
+    checkOutLabel,
+    "success:",
+    success
+  );
+  return success;
 }
 
 /**
  * Extract nightly price for the selected dates from the hotel card:
- *  1) Find <a> whose aria-label roughly matches the hotel name
+ *  1) Find <a> whose aria-label best matches the hotel name (by token overlap)
  *  2) Inside that <a>, prefer text like "$44 nightly"
  *  3) If not found, fall back to first "$XX" inside the same <a>
  */
@@ -107,41 +107,59 @@ async function extractSelectedDatesPrice(page, hotelName) {
     if (!hotelNameInner) return null;
 
     const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
-    const target = norm(hotelNameInner);
+
+    // Break hotel name into "strong" tokens (ignore generic words)
+    const stopwords = new Set(["hotel", "inn", "the", "at", "suites", "and"]);
+    const tokens = norm(hotelNameInner)
+      .split(" ")
+      .filter((t) => t && !stopwords.has(t) && t.length > 2);
+
+    if (!tokens.length) return null;
 
     const anchors = Array.from(document.querySelectorAll('a[aria-label]'));
+
+    let bestAnchor = null;
+    let bestScore = 0;
 
     for (const a of anchors) {
       const label = a.getAttribute("aria-label") || "";
       const labelNorm = norm(label);
+      if (!labelNorm) continue;
 
-      // Loose match: label contains hotel name or vice versa
-      if (!labelNorm.includes(target) && !target.includes(labelNorm)) continue;
-
-      // Collect all span/div texts inside this anchor with dollar amounts
-      const texts = [];
-      const nodes = Array.from(a.querySelectorAll("span, div"));
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!/\$\s?\d/.test(t)) continue;
-        texts.push(t);
+      let score = 0;
+      for (const tok of tokens) {
+        if (labelNorm.includes(tok)) score++;
       }
-
-      if (!texts.length) continue;
-
-      // Prefer "$XX nightly"
-      const nightly = texts.find((t) => /nightly/i.test(t) && /\$\s?\d/.test(t));
-      const chosenText = nightly || texts[0];
-
-      const m = chosenText.match(/\$\s?(\d[\d,]*)/);
-      if (!m) continue;
-      const num = Number(m[1].replace(/,/g, ""));
-      if (!Number.isFinite(num)) continue;
-
-      return num;
+      if (score > bestScore) {
+        bestScore = score;
+        bestAnchor = a;
+      }
     }
 
-    return null;
+    // Require at least some overlap with hotel name
+    if (!bestAnchor || bestScore === 0) return null;
+
+    // Collect all span/div texts inside this anchor with dollar amounts
+    const nodes = Array.from(bestAnchor.querySelectorAll("span, div"));
+    const priceTexts = [];
+    for (const n of nodes) {
+      const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+      if (!/\$\s?\d/.test(t)) continue;
+      priceTexts.push(t);
+    }
+    if (!priceTexts.length) return null;
+
+    // Prefer "$XX nightly"
+    const nightly = priceTexts.find(
+      (t) => /nightly/i.test(t) && /\$\s?\d/.test(t)
+    );
+    const chosenText = nightly || priceTexts[0];
+
+    const m = chosenText.match(/\$\s?(\d[\d,]*)/);
+    if (!m) return null;
+
+    const num = Number(m[1].replace(/,/g, ""));
+    return Number.isFinite(num) ? num : null;
   }, hotelName);
 }
 
@@ -157,6 +175,7 @@ export async function getGoogleHotelsPriceSimple(
     throw new Error("getGoogleHotelsPriceSimple: checkIn and checkOut are required");
   }
 
+  // Only hotelName is used now; city is intentionally ignored inside makeGoogleSearchUrl.
   const url = makeGoogleSearchUrl(hotelName, city);
 
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
@@ -198,4 +217,3 @@ export async function getGoogleHotelsPriceSimple(
     await browser.close();
   }
 }
-
