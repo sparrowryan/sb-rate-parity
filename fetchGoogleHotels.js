@@ -16,7 +16,7 @@ function cleanCity(cityRaw) {
   return c.trim();
 }
 
-// Build a Google Travel search URL WITHOUT trusting dates
+// Build a Google Travel search URL
 export function makeGoogleSearchUrl(name, city) {
   const qParts = [];
   if (name) qParts.push(name);
@@ -27,28 +27,13 @@ export function makeGoogleSearchUrl(name, city) {
 }
 
 /**
- * Try to set the desired date range using Google's date picker.
- * This version is much more defensive:
- *  - waits for Check-in input
- *  - clicks it to open calendar
- *  - waits for gridcells to exist
- *  - matches only on "Month D, YYYY" part of the aria-label
- *  - logs sample aria-labels if nothing matches
+ * Try to set the date range via the *actual* calendar UI.
+ * Returns { success, uiCheckIn, uiCheckOut } where uiCheckIn/out are the strings
+ * shown in the input boxes (e.g. "Wed, Nov 26").
  */
 async function setDateRangeInUi(page, checkIn, checkOut) {
-  const checkInDate = dayjs(checkIn);
-  const checkOutDate = dayjs(checkOut);
-
-  if (!checkInDate.isValid() || !checkOutDate.isValid()) {
-    console.warn("[Google] Invalid checkIn/checkOut passed to setDateRangeInUi", {
-      checkIn,
-      checkOut,
-    });
-    return;
-  }
-
-  const inLabelPart = checkInDate.format("MMMM D, YYYY");   // e.g. "November 26, 2025"
-  const outLabelPart = checkOutDate.format("MMMM D, YYYY"); // e.g. "November 28, 2025"
+  const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // e.g. "November 26, 2025"
+  const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // e.g. "November 28, 2025"
 
   console.log("[Google] Trying to set dates via UI:", {
     checkIn,
@@ -57,78 +42,55 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
     outLabelPart,
   });
 
-  // 1) Wait for a Check-in input and click it to open the calendar
-  const checkInInput = await page
-    .waitForSelector('input[aria-label*="Check-in"]', { timeout: 20000 })
-    .catch(() => null);
-
-  if (!checkInInput) {
-    console.warn("[Google] Could not find Check-in input; skipping date set.");
-    return;
+  // 1) Open the date picker via the Check-in input
+  const dateInput = page.locator(
+    'input[aria-label*="Check-in"], input[aria-label*="Check in"]'
+  );
+  if ((await dateInput.count()) === 0) {
+    console.warn("[Google] No Check-in input found; cannot open calendar.");
+    return { success: false, uiCheckIn: "", uiCheckOut: "" };
   }
 
+  await dateInput.first().click();
+  // Give the calendar time to appear
+  await page.waitForTimeout(1500);
+
+  // 2) Wait for date cells to appear (your real selector)
   try {
-    await checkInInput.click({ force: true });
-  } catch (e) {
-    console.warn("[Google] Failed to click Check-in input:", e.toString());
-    return;
+    await page
+      .locator('div[jsname="nEWxA"][aria-label]')
+      .first()
+      .waitFor({ timeout: 5000 });
+  } catch {
+    console.warn("[Google] No date cells (div[jsname='nEWxA']) appeared after opening calendar.");
+    // still continue, but success likely false
   }
 
-  // 2) Wait for any gridcell to appear (calendar rendered)
-  const firstCell = await page
-    .waitForSelector('[role="gridcell"][aria-label]', { timeout: 20000 })
-    .catch(() => null);
-
-  if (!firstCell) {
-    console.warn("[Google] No date gridcells appeared after opening calendar.");
-    return;
-  }
-
-  // At this point, the calendar is up. We'll click dates via page.evaluate()
+  // Helper to click a date cell by part of its aria-label
   async function clickDateByLabelPart(labelPart) {
-    return await page.evaluate((needle) => {
-      const cells = Array.from(
-        document.querySelectorAll('[role="gridcell"][aria-label]')
-      );
-      const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
-      const target = norm(needle);
-
-      let clicked = false;
-
-      for (const c of cells) {
-        const lbl = c.getAttribute("aria-label") || "";
-        if (norm(lbl).includes(target)) {
-          // click the <div role="button"> wrapper if needed, otherwise the cell itself
-          const btn = c.closest('[role="button"]') || c;
-          (btn).dispatchEvent(
-            new MouseEvent("click", { bubbles: true, cancelable: true })
-          );
-          clicked = true;
-          break;
-        }
-      }
-
-      if (!clicked) {
-        // Surface some labels so we can debug mismatches
-        const sample = cells.slice(0, 10).map((c) => c.getAttribute("aria-label"));
-        console.warn(
-          "[Google] Could not find any date cell containing:",
-          needle,
-          "Sample labels:",
-          sample
-        );
-      }
-
-      return clicked;
-    }, labelPart);
+    if (!labelPart) return false;
+    const locator = page.locator(
+      `div[role="button"] div[jsname="nEWxA"][aria-label*="${labelPart}"]`
+    );
+    const count = await locator.count();
+    if (!count) {
+      console.warn("[Google] Could not find date cell for label part:", labelPart);
+      return false;
+    }
+    try {
+      await locator.first().click();
+      return true;
+    } catch (err) {
+      console.warn("[Google] Failed clicking date cell for:", labelPart, String(err));
+      return false;
+    }
   }
 
   const okIn = await clickDateByLabelPart(inLabelPart);
-  // tiny pause before selecting checkout
   await page.waitForTimeout(300);
   const okOut = await clickDateByLabelPart(outLabelPart);
 
-  // Click "Done"/"Apply"/"Save" if present
+  // Sometimes there's a Done/Apply button; try to click if present, but it's optional
   const doneSelectors = [
     'button:has-text("Done")',
     'button:has-text("Apply")',
@@ -140,30 +102,36 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
       try {
         await btn.click();
         break;
-      } catch (e) {
-        console.warn("[Google] Failed clicking date dialog button", sel, e.toString());
+      } catch {
+        // ignore
       }
     }
   }
 
-  // Wait for prices to refresh after date change (a bit longer to be safe)
-  await page.waitForTimeout(5000);
+  // Wait for prices to refresh after date change
+  await page.waitForTimeout(4000);
 
-  console.log(
-    "[Google] Date range set in UI via label parts",
-    inLabelPart,
-    "→",
-    outLabelPart,
-    "success:",
-    okIn && okOut
-  );
+  // Read back what the UI actually shows
+  const { uiCheckIn, uiCheckOut } = await page.evaluate(() => {
+    const inEl =
+      document.querySelector('input[aria-label*="Check-in"], input[aria-label*="Check in"]');
+    const outEl =
+      document.querySelector('input[aria-label*="Check-out"], input[aria-label*="Check out"]');
+    return {
+      uiCheckIn: inEl?.value || "",
+      uiCheckOut: outEl?.value || "",
+    };
+  });
+
+  console.log("[Google] UI date inputs now:", { uiCheckIn, uiCheckOut });
+
+  return { success: okIn && okOut, uiCheckIn, uiCheckOut };
 }
 
 /**
  * Extract nightly price for the selected dates from the hotel card:
  *  1) Find <a> whose aria-label roughly matches the hotel name
- *  2) Inside that <a>, prefer text like "$44 nightly"
- *  3) If not found, fall back to first "$XX" inside the same <a>
+ *  2) Inside that <a>, look for any "$XX" text, prefer "$XX nightly" if present
  */
 async function extractSelectedDatesPrice(page, hotelName) {
   return await page.evaluate((hotelNameInner) => {
@@ -210,7 +178,7 @@ async function extractSelectedDatesPrice(page, hotelName) {
 
 /**
  * Get ONE Google reference nightly price for a hotel for a specific date range.
- * Expects explicit checkIn/checkOut (YYYY-MM-DD).
+ * We ONLY trust the price if the UI dates contain the requested month+day.
  */
 export async function getGoogleHotelsPriceSimple(
   hotelName,
@@ -222,19 +190,44 @@ export async function getGoogleHotelsPriceSimple(
   }
 
   const url = makeGoogleSearchUrl(hotelName, city);
+  console.log("[Google] Opening:", url);
 
   const browser = await chromium.launch({ args: ["--no-sandbox"] });
   const page = await browser.newPage();
 
   try {
-    console.log("[Google] Opening:", url);
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-
     // Let the base UI load
     await page.waitForTimeout(3000);
 
-    // Try to set date range via UI to override Google's default dates
-    await setDateRangeInUi(page, checkIn, checkOut);
+    // Try to set date range via UI
+    const setRes = await setDateRangeInUi(page, checkIn, checkOut);
+
+    // Check if the UI actually shows the dates we wanted (by month+day)
+    const wantInShort = dayjs(checkIn).format("MMM D");   // "Nov 26"
+    const wantOutShort = dayjs(checkOut).format("MMM D"); // "Nov 28"
+    const uiIn = setRes.uiCheckIn || "";
+    const uiOut = setRes.uiCheckOut || "";
+
+    const datesMatch =
+      uiIn.includes(wantInShort) &&
+      uiOut.includes(wantOutShort);
+
+    if (!datesMatch) {
+      console.warn("[Google] Date mismatch – skipping price for hotel:", hotelName, {
+        requestedCheckIn: checkIn,
+        requestedCheckOut: checkOut,
+        uiCheckIn: uiIn,
+        uiCheckOut: uiOut,
+      });
+
+      return {
+        check_in: checkIn,
+        check_out: checkOut,
+        url,
+        google_best: null,
+      };
+    }
 
     // Scroll a bit so cards & tooltips render
     for (let i = 0; i < 3; i++) {
