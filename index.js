@@ -2,12 +2,12 @@
 import dayjs from "dayjs";
 import fetch from "node-fetch";
 import { getSparrowHotels } from "./scrapeSparrowBid.js";
-// If your Google function is still called getGoogleHotelsPrices, change this import accordingly:
+// Adjust this import name if your Google file exports a different name
 import { getGoogleHotelsPriceSimple as getGoogleHotelsPrices } from "./fetchGoogleHotels.js";
 
 const WEBHOOK = process.env.WEBHOOK_URL;
 
-// Existing config (keep / tweak as needed)
+// Existing config
 const CHECKIN_OFFSET_DAYS = Number(process.env.CHECKIN_OFFSET_DAYS || 7);
 const NIGHTS = Number(process.env.NIGHTS || 2);
 
@@ -36,20 +36,27 @@ function getPoliteDelayMs() {
       );
     }
 
+    // Derive SparrowBid check-in/check-out window from env
+    const base = dayjs().add(CHECKIN_OFFSET_DAYS, "day");
+    const checkIn = base.format("YYYY-MM-DD");
+    const checkOut = base.add(NIGHTS, "day").format("YYYY-MM-DD");
+
     console.log("=== sb-rate-parity run starting ===");
     console.log("CONFIG:", {
       MAX_HOTELS,
       DRY_RUN,
       CHECKIN_OFFSET_DAYS,
       NIGHTS,
+      sbCheckIn: checkIn,
+      sbCheckOut: checkOut,
     });
 
     // -------- SCRAPE SPARROWBID (with pagination + SB URL capture) --------
     const allHotels = await getSparrowHotels({
       maxHotels: 600, // still scrape a big pool so we have options
       maxPages: 40,
-      fetchUrls: true,
-      settleMs: 500,
+      checkIn,
+      checkOut,
     });
 
     console.log("Total hotels scraped from SparrowBid:", allHotels.length);
@@ -132,7 +139,7 @@ function getPoliteDelayMs() {
         num(googleBest), // Google Best / OTA-min
         num(adv$), // SB Advantage $
         advPct != null ? advPct : "", // SB Advantage %
-        h.url || "", // SB URL
+        h.url || "", // SB URL (still empty from scraper unless you add it later)
         gh.url || "", // Google URL
       ];
 
