@@ -95,10 +95,11 @@ function getPoliteDelayMs() {
       // ---- GOOGLE SIDE ----
       // NOTE: adjust the args here to match your actual getGoogle... signature.
       // If you're on the "simple" version that takes explicit dates, update accordingly.
-      const gh = await getGoogleHotelsPrices(h.name, h.city, {
-        checkInOffsetDays: CHECKIN_OFFSET_DAYS,
-        nights: NIGHTS,
-      });
+   const gh = await getGoogleHotelsPrices(h.name, h.city, {
+  checkIn,
+  checkOut,
+});
+
 
       console.log("[Google] result object:", gh);
 
