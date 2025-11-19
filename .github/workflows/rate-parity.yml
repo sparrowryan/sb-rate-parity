@@ -1,0 +1,47 @@
+name: Run Rate Parity Scraper
+
+on:
+  # Manual trigger in the Actions tab
+  workflow_dispatch:
+
+  # Scheduled run (UTC)
+  # This example is every Monday at 14:00 UTC (~8:00 AM Central, depending on DST)
+  schedule:
+    - cron: "0 14 * * 1"
+
+jobs:
+  run-scraper:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+
+      - name: Install Playwright Chromium
+        run: npx playwright install --with-deps chromium
+
+      - name: Run rate parity script
+        env:
+          # Must be set in Settings → Secrets → Actions
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+
+          # These two are still here in case your Google code uses them;
+          # you can remove them once everything is fully "Google-leads" driven.
+          CHECKIN_OFFSET_DAYS: 7
+          NIGHTS: 2
+
+          # Testing controls:
+          # - Start with DRY_RUN="true" and a small MAX_HOTELS
+          # - When happy with logs, set DRY_RUN="false" and bump MAX_HOTELS
+          MAX_HOTELS: 5        # only process 5 hotels per run while testing
+          DRY_RUN: "true"      # log rows but DO NOT write to the sheet
+        run: node index.js
