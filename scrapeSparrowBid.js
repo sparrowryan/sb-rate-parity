@@ -53,7 +53,7 @@ export async function getSparrowHotels({
   });
 
   // Wait until at least one card is on the page
-  await page.waitForSelector(".sb_todays_deals_card_ctn", { timeout: 15000 });
+  await page.waitForSelector(".sb_todays_deals_card_ctn", { timeout: 20000 });
 
   async function extractCards() {
     return await page.$$eval(".sb_todays_deals_card_ctn", (cards) => {
@@ -84,7 +84,7 @@ export async function getSparrowHotels({
           name,
           city,
           priceRaw,
-          url: "", // we'll synthesize a URL in index.js
+          url: "", // still synthesized later in index.js if needed
         });
       }
       return out;
@@ -108,14 +108,14 @@ export async function getSparrowHotels({
   // -------- PAGE 1 --------
   let cards = await extractCards();
   pushUnique(cards);
+  console.log(
+    `Page 1: collected ${cards.length} cards, total ${results.length}`
+  );
 
   // -------- PAGINATION (using the "→" button) --------
   for (let pageIndex = 2; pageIndex <= maxPages; pageIndex++) {
     if (results.length >= maxHotels) break;
 
-    const beforeFirstName = cards[0]?.name || "";
-
-    // Find all buttons that have the arrow text "→"
     const nextButtons = page.locator('button:has-text("→")');
     const count = await nextButtons.count();
     if (!count) {
@@ -130,41 +130,41 @@ export async function getSparrowHotels({
       if (disabledAttr !== null) continue; // skip disabled buttons
 
       try {
-        await Promise.all([
-          // wait for first card’s name to change (or timeout)
-          page
-            .waitForFunction(
-              (prev) => {
-                const card = document.querySelector(
-                  ".sb_todays_deals_card_ctn .sb_todays_deals_card_heading"
-                );
-                if (!card) return false;
-                const now = card.textContent?.trim() || "";
-                return now && now !== prev;
-              },
-              { timeout: 8000, polling: 200 },
-              beforeFirstName
-            )
-            .catch(() => null),
-          btn.click(),
-        ]);
+        await btn.click();
         clicked = true;
         break;
       } catch {
-        // try next button
+        // try next button if click fails
       }
     }
 
     if (!clicked) {
-      console.log("Could not click a usable Next button; stopping at page", pageIndex - 1);
+      console.log(
+        "Could not click a usable Next button; stopping at page",
+        pageIndex - 1
+      );
       break;
     }
 
-    await page.waitForTimeout(800);
+    // Give the page more time to re-render new cards
+    await page.waitForTimeout(1500);
 
-    cards = await extractCards();
+    // Retry a few times if we initially see 0 cards
+    let retries = 0;
+    while (retries < 3) {
+      cards = await extractCards();
+      if (cards.length > 0) break;
+      retries++;
+      console.log(
+        `Page ${pageIndex}: 0 cards on attempt ${retries}, retrying after delay...`
+      );
+      await page.waitForTimeout(1000);
+    }
+
     const done = pushUnique(cards);
-    console.log(`Page ${pageIndex}: collected ${cards.length} cards, total ${results.length}`);
+    console.log(
+      `Page ${pageIndex}: collected ${cards.length} cards (after ${retries} retries), total ${results.length}`
+    );
     if (done) break;
   }
 
