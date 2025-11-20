@@ -34,7 +34,7 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
     outLabelPart,
   });
 
-  // 1) Open the date picker via the Check-in input
+  // Open the date picker via the Check-in input
   const dateInput = page.locator(
     'input[aria-label*="Check-in"], input[aria-label*="Check in"]'
   );
@@ -46,7 +46,7 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   await dateInput.first().click();
   await page.waitForTimeout(1500); // let calendar open
 
-  // 2) Wait for date cells to appear (your real calendar selector)
+  // Wait for calendar date cells (your real selector)
   try {
     await page
       .locator('div[jsname="nEWxA"][aria-label]')
@@ -118,7 +118,7 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   return { success: okIn && okOut, uiCheckIn, uiCheckOut };
 }
 
-// ----- Fallback / main-card price (this was working) -----
+// ----- Existing “headline” price extractor (this was working) -----
 
 async function extractSelectedDatesPrice(page, hotelName) {
   return await page.evaluate((hotelNameInner) => {
@@ -169,7 +169,7 @@ async function openViewPricesIfExists(page) {
   const btn = page.locator('button:has-text("View prices")');
   const count = await btn.count();
   if (!count) {
-    console.log("[Google] No 'View prices' button found; maybe already expanded.");
+    console.log("[Google] No 'View prices' button found; maybe already expanded or different layout.");
     return false;
   }
   try {
@@ -253,7 +253,10 @@ export async function getGoogleHotelsPriceSimple(
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
     await page.waitForTimeout(3000); // initial load
 
-    // 1) Set date range via UI and read back actual dates
+    // 1) FIRST: try to click "View prices" to anchor on the hotel, like you do manually
+    await openViewPricesIfExists(page);
+
+    // 2) Then set date range via UI
     const setRes = await setDateRangeInUi(page, checkIn, checkOut);
 
     const wantInShort = dayjs(checkIn).format("MMM D");   // "Nov 26"
@@ -282,21 +285,19 @@ export async function getGoogleHotelsPriceSimple(
       };
     }
 
-    // 2) Scroll a bit to ensure cards & buttons render
+    // 3) Scroll a bit to ensure cards & buttons render
     for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(600);
     }
 
-    // 3) FIRST: do the same safe "headline" extraction we already know works
+    // 4) Safe "headline" price (Google All) — same method that was working
     const google_best = await extractSelectedDatesPrice(page, hotelName);
     console.log("[Google] selected-dates price for", hotelName, "=", google_best, "URL:", url);
 
-    // 4) THEN: try to open provider panel and compute lowest major OTA price
-    let google_major_best = null;
-    await openViewPricesIfExists(page);
-    google_major_best = await extractMajorProviderPrice(page);
-
+    // 5) Make sure provider panel is open, then read majors
+    await openViewPricesIfExists(page); // if already open, this will likely just log and skip
+    const google_major_best = await extractMajorProviderPrice(page);
     console.log("[Google] major-provider price for", hotelName, "=", google_major_best);
 
     return {
@@ -310,5 +311,4 @@ export async function getGoogleHotelsPriceSimple(
     await browser.close();
   }
 }
-
 
