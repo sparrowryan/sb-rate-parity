@@ -2,7 +2,7 @@
 import dayjs from "dayjs";
 import { chromium } from "playwright";
 
-// ----- URL helpers -----
+// ---------- Helpers: city & URL ----------
 
 function cleanCity(cityRaw) {
   if (!cityRaw) return "";
@@ -21,11 +21,12 @@ export function makeGoogleSearchUrl(name, city) {
   return `https://www.google.com/travel/search?hl=en&gl=us&q=${q}`;
 }
 
-// ----- Date selection in UI -----
+// ---------- Date picker (UI) ----------
+// This is the critical piece: we *do* set the dates in Google’s calendar UI.
 
 async function setDateRangeInUi(page, checkIn, checkOut) {
-  const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // "November 26, 2025"
-  const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // "November 28, 2025"
+  const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // e.g. "November 26, 2025"
+  const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // e.g. "November 28, 2025"
 
   console.log("[Google] Trying to set dates via UI:", {
     checkIn,
@@ -34,91 +35,83 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
     outLabelPart,
   });
 
-  // Open the date picker via the Check-in input
-  const dateInput = page.locator(
-    'input[aria-label*="Check-in"], input[aria-label*="Check in"]'
-  );
-  if ((await dateInput.count()) === 0) {
-    console.warn("[Google] No Check-in input found; cannot open calendar.");
-    return { success: false, uiCheckIn: "", uiCheckOut: "" };
-  }
-
-  await dateInput.first().click();
-  await page.waitForTimeout(1500); // let calendar open
-
-  // Wait for calendar date cells (your real selector)
+  // 1) Open the date picker by clicking the Check-in input
   try {
-    await page
-      .locator('div[jsname="nEWxA"][aria-label]')
-      .first()
-      .waitFor({ timeout: 5000 });
-  } catch {
-    console.warn("[Google] No date cells (div[jsname='nEWxA']) appeared after opening calendar.");
-  }
+    const input = page
+      .locator('input[aria-label*="Check-in"], input[aria-label*="Check in"]')
+      .first();
 
-  // Helper to click a date cell by part of its aria-label
-  async function clickDateByLabelPart(labelPart) {
-    if (!labelPart) return false;
-    const locator = page.locator(
-      `div[role="button"] div[jsname="nEWxA"][aria-label*="${labelPart}"]`
-    );
-    const count = await locator.count();
-    if (!count) {
-      console.warn("[Google] Could not find date cell for label part:", labelPart);
+    if (!(await input.count())) {
+      console.warn("[Google] No Check-in input found; leaving Google default dates.");
       return false;
     }
+
+    await input.click({ force: true, timeout: 5000 });
+  } catch (err) {
+    console.warn(
+      "[Google] Failed to click Check-in input; leaving Google default dates.",
+      String(err)
+    );
+    return false;
+  }
+
+  // Give the calendar time to appear
+  await page.waitForTimeout(1000);
+
+  // Helper to click a date cell by aria-label substring
+  async function clickDate(labelPart) {
+    const loc = page.locator(`div[aria-label*="${labelPart}"]`).first();
     try {
-      await locator.first().click();
+      await loc.waitFor({ state: "visible", timeout: 5000 });
+      await loc.click({ force: true });
       return true;
     } catch (err) {
-      console.warn("[Google] Failed clicking date cell for:", labelPart, String(err));
+      console.warn("[Google] Could not click date for labelPart:", labelPart, String(err));
       return false;
     }
   }
 
-  const okIn = await clickDateByLabelPart(inLabelPart);
+  const okIn = await clickDate(inLabelPart);
   await page.waitForTimeout(300);
-  const okOut = await clickDateByLabelPart(outLabelPart);
+  const okOut = await clickDate(outLabelPart);
 
-  // Click Done / Apply / Save if present
-  const doneSelectors = [
-    'button:has-text("Done")',
-    'button:has-text("Apply")',
-    'button:has-text("Save")',
-  ];
-  for (const sel of doneSelectors) {
-    const btn = await page.$(sel);
-    if (btn) {
-      try {
-        await btn.click();
-        break;
-      } catch {
-        // ignore
-      }
+  // Click "Done" / "Apply" / "Save" if present
+  try {
+    const doneBtn = page
+      .locator(
+        'button:has-text("Done"), button:has-text("Apply"), button:has-text("Save")'
+      )
+      .first();
+    if (await doneBtn.count()) {
+      await doneBtn.click({ timeout: 5000 }).catch(() => {});
     }
+  } catch {
+    // non-fatal
   }
 
-  // Wait for prices to refresh after date change
-  await page.waitForTimeout(4000);
+  // Let prices refresh
+  await page.waitForTimeout(3000);
 
-  // Read back what the UI actually shows
-  const { uiCheckIn, uiCheckOut } = await page.evaluate(() => {
-    const inEl =
-      document.querySelector('input[aria-label*="Check-in"], input[aria-label*="Check in"]');
-    const outEl =
-      document.querySelector('input[aria-label*="Check-out"], input[aria-label*="Check out"]');
+  // Log what the UI thinks the dates are
+  const uiDates = await page.evaluate(() => {
+    const getVal = (needle) => {
+      const el =
+        document.querySelector(`input[aria-label*="${needle}"]`) ||
+        document.querySelector(`input[aria-label*="${needle.replace("-", " ")}"]`);
+      return el ? el.value : null;
+    };
     return {
-      uiCheckIn: inEl?.value || "",
-      uiCheckOut: outEl?.value || "",
+      uiCheckIn: getVal("Check-in") || getVal("Check in"),
+      uiCheckOut: getVal("Check-out") || getVal("Check out"),
     };
   });
 
-  console.log("[Google] UI date inputs now:", { uiCheckIn, uiCheckOut });
+  console.log("[Google] UI date inputs now:", uiDates);
 
-  return { success: okIn && okOut, uiCheckIn, uiCheckOut };
+  return okIn && okOut;
 }
 
-// ----- Existing “headline” price extractor (this was working) -----
+// ---------- Card-level price (this is your Google BEST) ----------
 
 async function extractSelectedDatesPrice(page, hotelName) {
   return await page.evaluate((hotelNameInner) => {
@@ -126,9 +119,9 @@ async function extractSelectedDatesPrice(page, hotelName) {
 
     const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
     const target = norm(hotelNameInner);
-
-    const anchors = Array.from(document.querySelectorAll('a[aria-label]'));
     const priceRegex = /\$\s?(\d[\d,]*)/;
+
+    const anchors = Array.from(document.querySelectorAll("a[aria-label]"));
 
     for (const a of anchors) {
       const label = a.getAttribute("aria-label") || "";
@@ -139,6 +132,7 @@ async function extractSelectedDatesPrice(page, hotelName) {
 
       const texts = [];
       const nodes = Array.from(a.querySelectorAll("span, div"));
+
       for (const n of nodes) {
         const t = (n.textContent || "").replace(/\s+/g, " ").trim();
         if (!priceRegex.test(t)) continue;
@@ -147,12 +141,15 @@ async function extractSelectedDatesPrice(page, hotelName) {
 
       if (!texts.length) continue;
 
-      // Prefer "$XX nightly"
-      const nightly = texts.find((t) => /nightly/i.test(t) && priceRegex.test(t));
+      // Prefer "$XX nightly" if available
+      const nightly = texts.find(
+        (t) => /nightly/i.test(t) && priceRegex.test(t)
+      );
       const chosenText = nightly || texts[0];
 
       const m = chosenText.match(priceRegex);
       if (!m) continue;
+
       const num = Number(m[1].replace(/,/g, ""));
       if (!Number.isFinite(num)) continue;
 
@@ -163,18 +160,20 @@ async function extractSelectedDatesPrice(page, hotelName) {
   }, hotelName);
 }
 
-// ----- "View prices" and major-provider parsing -----
+// ---------- "View prices" + Major OTA block ----------
 
 async function openViewPricesIfExists(page) {
   const btn = page.locator('button:has-text("View prices")');
   const count = await btn.count();
   if (!count) {
-    console.log("[Google] No 'View prices' button found; maybe already expanded or different layout.");
+    console.log(
+      "[Google] No 'View prices' button found; maybe already expanded or different layout."
+    );
     return false;
   }
   try {
     await btn.first().click();
-    await page.waitForTimeout(3000); // give panel time to load providers
+    await page.waitForTimeout(3000); // let provider panel load
     console.log("[Google] Clicked 'View prices' button.");
     return true;
   } catch (err) {
@@ -211,7 +210,9 @@ async function extractMajorProviderPrice(page) {
       if (!nameEl) return;
 
       const providerName = (nameEl.textContent || "").trim().toLowerCase();
-      const isMajor = majorBrands.some((brand) => providerName.includes(brand));
+      const isMajor = majorBrands.some((brand) =>
+        providerName.includes(brand)
+      );
       if (!isMajor) return;
 
       const blockPrices = [];
@@ -232,7 +233,11 @@ async function extractMajorProviderPrice(page) {
   });
 }
 
-// ----- Main exported function -----
+// ---------- Main exported function ----------
+// IMPORTANT:
+//   • We DO set dates in the UI (so Google matches SB dates).
+//   • google_best comes from the card for those dates.
+//   • google_major_best is best-effort and cannot crash the run.
 
 export async function getGoogleHotelsPriceSimple(
   hotelName,
@@ -251,54 +256,46 @@ export async function getGoogleHotelsPriceSimple(
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-    await page.waitForTimeout(3000); // initial load
+    await page.waitForTimeout(3000); // base load
 
-    // 1) FIRST: try to click "View prices" to anchor on the hotel, like you do manually
-    await openViewPricesIfExists(page);
+    // Set Google to the SAME dates we’re using on SparrowBid
+    await setDateRangeInUi(page, checkIn, checkOut);
 
-    // 2) Then set date range via UI
-    const setRes = await setDateRangeInUi(page, checkIn, checkOut);
-
-    const wantInShort = dayjs(checkIn).format("MMM D");   // "Nov 26"
-    const wantOutShort = dayjs(checkOut).format("MMM D"); // "Nov 28"
-    const uiIn = setRes.uiCheckIn || "";
-    const uiOut = setRes.uiCheckOut || "";
-
-    const datesMatch =
-      uiIn.includes(wantInShort) &&
-      uiOut.includes(wantOutShort);
-
-    if (!datesMatch) {
-      console.warn("[Google] Date mismatch – skipping price for hotel:", hotelName, {
-        requestedCheckIn: checkIn,
-        requestedCheckOut: checkOut,
-        uiCheckIn: uiIn,
-        uiCheckOut: uiOut,
-      });
-
-      return {
-        check_in: checkIn,
-        check_out: checkOut,
-        url,
-        google_best: null,
-        google_major_best: null,
-      };
-    }
-
-    // 3) Scroll a bit to ensure cards & buttons render
+    // Scroll a bit so cards/tooltips render
     for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(600);
     }
 
-    // 4) Safe "headline" price (Google All) — same method that was working
+    // 1) Google all-OTA reference price (this is what was working before)
     const google_best = await extractSelectedDatesPrice(page, hotelName);
-    console.log("[Google] selected-dates price for", hotelName, "=", google_best, "URL:", url);
+    console.log(
+      "[Google] selected-dates price for",
+      hotelName,
+      "=",
+      google_best,
+      "URL:",
+      url
+    );
 
-    // 5) Make sure provider panel is open, then read majors
-    await openViewPricesIfExists(page); // if already open, this will likely just log and skip
-    const google_major_best = await extractMajorProviderPrice(page);
-    console.log("[Google] major-provider price for", hotelName, "=", google_major_best);
+    // 2) OPTIONAL: "major OTA" price (Expedia/Booking/etc.) — totally non-fatal
+    let google_major_best = null;
+    try {
+      await openViewPricesIfExists(page);
+      google_major_best = await extractMajorProviderPrice(page);
+      console.log(
+        "[Google] major-provider price for",
+        hotelName,
+        "=",
+        google_major_best
+      );
+    } catch (err) {
+      console.warn(
+        "[Google] major-provider extraction failed (non-fatal):",
+        String(err)
+      );
+      google_major_best = null;
+    }
 
     return {
       check_in: checkIn,
@@ -311,4 +308,5 @@ export async function getGoogleHotelsPriceSimple(
     await browser.close();
   }
 }
+
 
