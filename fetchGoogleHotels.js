@@ -2,16 +2,28 @@
 import dayjs from "dayjs";
 import { chromium } from "playwright";
 
-// ---------- Helpers: city & URL ----------
+/**
+ * Utility: turn "$123" / "123" / "1,234" into number or null
+ */
+function dollarsToNumber(s) {
+  const m = String(s || "").match(/(\d[\d,]*)/);
+  return m ? Number(m[1].replace(/,/g, "")) : null;
+}
 
+/**
+ * Clean city text (drop “mi away”, keep just city/region)
+ * "New York, US - 5385.12 mi away" → "New York, US"
+ */
 function cleanCity(cityRaw) {
   if (!cityRaw) return "";
   let c = String(cityRaw);
-  // "New York, US - 5385.12 mi away" → "New York, US"
   c = c.split(" - ")[0];
   return c.trim();
 }
 
+/**
+ * Build a Google Travel search URL using hotel name + city.
+ */
 export function makeGoogleSearchUrl(name, city) {
   const qParts = [];
   if (name) qParts.push(name);
@@ -21,12 +33,13 @@ export function makeGoogleSearchUrl(name, city) {
   return `https://www.google.com/travel/search?hl=en&gl=us&q=${q}`;
 }
 
-// ---------- Date picker (UI) ----------
-// This is the critical piece: we *do* set the dates in Google’s calendar UI.
-
+/**
+ * Use the Google date picker UI to set the desired check-in/check-out.
+ * We do this ONCE per hotel, then reuse those dates for both prices.
+ */
 async function setDateRangeInUi(page, checkIn, checkOut) {
-  const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // e.g. "November 26, 2025"
-  const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // e.g. "November 28, 2025"
+  const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // "November 26, 2025"
+  const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // "November 28, 2025"
 
   console.log("[Google] Trying to set dates via UI:", {
     checkIn,
@@ -35,91 +48,91 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
     outLabelPart,
   });
 
-  // 1) Open the date picker by clicking the Check-in input
+  // 1) Open date picker by clicking the check-in input
+  const checkInInput = page
+    .locator('input[aria-label*="Check-in"], input[aria-label*="Check in"]')
+    .first();
+
   try {
-    const input = page
-      .locator('input[aria-label*="Check-in"], input[aria-label*="Check in"]')
-      .first();
-
-    if (!(await input.count())) {
-      console.warn("[Google] No Check-in input found; leaving Google default dates.");
-      return false;
-    }
-
-    await input.click({ force: true, timeout: 5000 });
-  } catch (err) {
-    console.warn(
-      "[Google] Failed to click Check-in input; leaving Google default dates.",
-      String(err)
-    );
-    return false;
+    await checkInInput.waitFor({ timeout: 15000 });
+    await checkInInput.click();
+  } catch (e) {
+    console.warn("[Google] Could not open date picker:", e?.message || e);
+    return;
   }
 
-  // Give the calendar time to appear
-  await page.waitForTimeout(1000);
-
-  // Helper to click a date cell by aria-label substring
-  async function clickDate(labelPart) {
-    const loc = page.locator(`div[aria-label*="${labelPart}"]`).first();
-    try {
-      await loc.waitFor({ state: "visible", timeout: 5000 });
-      await loc.click({ force: true });
-      return true;
-    } catch (err) {
-      console.warn("[Google] Could not click date for labelPart:", labelPart, String(err));
-      return false;
-    }
-  }
-
-  const okIn = await clickDate(inLabelPart);
-  await page.waitForTimeout(300);
-  const okOut = await clickDate(outLabelPart);
-
-  // Click "Done" / "Apply" / "Save" if present
+  // Wait for calendar gridcells to appear
+  const gridcellSelector = '[role="gridcell"][aria-label]';
   try {
-    const doneBtn = page
-      .locator(
-        'button:has-text("Done"), button:has-text("Apply"), button:has-text("Save")'
-      )
-      .first();
-    if (await doneBtn.count()) {
-      await doneBtn.click({ timeout: 5000 }).catch(() => {});
-    }
+    await page.waitForSelector(gridcellSelector, { timeout: 8000 });
   } catch {
-    // non-fatal
+    console.warn("[Google] No date gridcells appeared after opening calendar.");
+    return;
   }
 
-  // Let prices refresh
-  await page.waitForTimeout(3000);
+  // Helper to click a date cell based on an aria-label containing the date text
+  async function clickDateCellByPartialLabel(labelPart) {
+    const sel = `${gridcellSelector}[aria-label*="${labelPart}"]`;
+    const cell = await page.$(sel);
+    if (!cell) {
+      console.warn("[Google] Could not find date cell for label:", labelPart);
+      return false;
+    }
+    await cell.click();
+    return true;
+  }
 
-  // Log what the UI thinks the dates are
-  const uiDates = await page.evaluate(() => {
-    const getVal = (needle) => {
-      const el =
-        document.querySelector(`input[aria-label*="${needle}"]`) ||
-        document.querySelector(`input[aria-label*="${needle.replace("-", " ")}"]`);
-      return el ? el.value : null;
+  const okIn = await clickDateCellByPartialLabel(inLabelPart);
+  await page.waitForTimeout(300);
+  const okOut = await clickDateCellByPartialLabel(outLabelPart);
+
+  // Click Done / Apply / Save if present
+  const doneSelectors = [
+    'button:has-text("Done")',
+    'button:has-text("Apply")',
+    'button:has-text("Save")',
+  ];
+  for (const sel of doneSelectors) {
+    try {
+      const btn = await page.$(sel);
+      if (btn) {
+        await btn.click();
+        break;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  await page.waitForTimeout(4000);
+
+  // Log the values in the UI so we can confirm in logs
+  const uiValues = await page.evaluate(() => {
+    const inputs = document.querySelectorAll(
+      'input[aria-label*="Check-in"], input[aria-label*="Check in"]'
+    );
+    const out = {
+      uiCheckIn: inputs[0]?.value || null,
+      uiCheckOut: inputs[1]?.value || null,
     };
-    return {
-      uiCheckIn: getVal("Check-in") || getVal("Check in"),
-      uiCheckOut: getVal("Check-out") || getVal("Check out"),
-    };
+    return out;
   });
-
-  console.log("[Google] UI date inputs now:", uiDates);
-
-  return okIn && okOut;
+  console.log("[Google] UI date inputs now:", uiValues);
 }
 
-// ---------- Card-level price (this is your Google BEST) ----------
-
+/**
+ * Extract the "Google best" nightly price from the hotel card
+ * for the current selected dates.
+ *
+ * This is the method that has been working well.
+ */
 async function extractSelectedDatesPrice(page, hotelName) {
   return await page.evaluate((hotelNameInner) => {
     if (!hotelNameInner) return null;
 
-    const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const norm = (s) =>
+      (s || "").toLowerCase().replace(/\s+/g, " ").trim();
     const target = norm(hotelNameInner);
-    const priceRegex = /\$\s?(\d[\d,]*)/;
 
     const anchors = Array.from(document.querySelectorAll("a[aria-label]"));
 
@@ -127,29 +140,29 @@ async function extractSelectedDatesPrice(page, hotelName) {
       const label = a.getAttribute("aria-label") || "";
       const labelNorm = norm(label);
 
-      // Loose match: label contains hotel name or vice versa
-      if (!labelNorm.includes(target) && !target.includes(labelNorm)) continue;
-
-      const texts = [];
-      const nodes = Array.from(a.querySelectorAll("span, div"));
-
-      for (const n of nodes) {
-        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
-        if (!priceRegex.test(t)) continue;
-        texts.push(t);
+      // Loose text match between card's aria-label and hotel name
+      if (!labelNorm.includes(target) && !target.includes(labelNorm)) {
+        continue;
       }
 
+      // Inside that card anchor, find any spans/divs with dollar amounts
+      const texts = [];
+      const nodes = Array.from(a.querySelectorAll("span, div"));
+      for (const n of nodes) {
+        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (!/\$\s?\d/.test(t)) continue;
+        texts.push(t);
+      }
       if (!texts.length) continue;
 
-      // Prefer "$XX nightly" if available
+      // Prefer something like "$44 nightly"
       const nightly = texts.find(
-        (t) => /nightly/i.test(t) && priceRegex.test(t)
+        (t) => /nightly/i.test(t) && /\$\s?\d/.test(t)
       );
-      const chosenText = nightly || texts[0];
+      const chosen = nightly || texts[0];
 
-      const m = chosenText.match(priceRegex);
+      const m = chosen.match(/\$\s?(\d[\d,]*)/);
       if (!m) continue;
-
       const num = Number(m[1].replace(/,/g, ""));
       if (!Number.isFinite(num)) continue;
 
@@ -160,85 +173,114 @@ async function extractSelectedDatesPrice(page, hotelName) {
   }, hotelName);
 }
 
-// ---------- "View prices" + Major OTA block ----------
-
-async function openViewPricesIfExists(page) {
-  const btn = page.locator('button:has-text("View prices")');
-  const count = await btn.count();
-  if (!count) {
-    console.log(
-      "[Google] No 'View prices' button found; maybe already expanded or different layout."
-    );
-    return false;
-  }
+/**
+ * Experimental: extract lowest OTA price restricted to “major” OTAs.
+ * This is *guard-railed*:
+ *  - If anything looks off, returns null instead of bad data.
+ *  - We never throw — errors are caught and logged.
+ */
+async function getGoogleMajorBest(page, hotelName) {
   try {
-    await btn.first().click();
-    await page.waitForTimeout(3000); // let provider panel load
-    console.log("[Google] Clicked 'View prices' button.");
-    return true;
-  } catch (err) {
-    console.warn("[Google] Failed to click 'View prices':", String(err));
-    return false;
-  }
-}
+    // Try to click a "View prices" button. We *do not* re-touch dates here,
+    // we rely on the global date filter already being set.
+    const viewBtn = page.locator('button:has-text("View prices")').first();
+    const count = await viewBtn.count();
+    if (!count) {
+      console.log("[Google major] No 'View prices' button found; returning null.");
+      return null;
+    }
 
-async function extractMajorProviderPrice(page) {
-  return await page.evaluate(() => {
-    const priceRegex = /\$\s?(\d[\d,]*)/;
-    const parsePrice = (text) => {
-      if (!text) return null;
-      const t = String(text).replace(/\s+/g, " ").trim();
-      const m = t.match(priceRegex);
-      return m ? Number(m[1].replace(/,/g, "")) : null;
-    };
+    await viewBtn.click({ timeout: 15000 });
+    await page.waitForTimeout(4000);
 
-    const majorBrands = [
-      "expedia",
-      "booking.com",
-      "priceline",
-      "kayak",
-      "hotels.com",
-      "orbitz",
-      "travelocity",
-    ];
+    // Check the main H1 hotel name on the view-prices/overlay/detail panel
+    const h1Locator = page.locator("h1").first();
+    const h1Text = (await h1Locator.textContent().catch(() => null)) || "";
+    const norm = (s) =>
+      (s || "").toLowerCase().replace(/[^a-z0-9 ]+/g, " ").replace(/\s+/g, " ").trim();
 
-    const majorPrices = [];
+    const target = norm(hotelName);
+    const got = norm(h1Text);
 
-    const providerBlocks = document.querySelectorAll(".ADs2Tc");
-    providerBlocks.forEach((block) => {
-      const nameEl = block.querySelector("h3.RjilDd");
-      if (!nameEl) return;
-
-      const providerName = (nameEl.textContent || "").trim().toLowerCase();
-      const isMajor = majorBrands.some((brand) =>
-        providerName.includes(brand)
+    if (!target || !got) {
+      console.log(
+        "[Google major] Missing names for fuzzy match; returning null.",
+        { target, got }
       );
-      if (!isMajor) return;
+      return null;
+    }
 
-      const blockPrices = [];
-      const spans = block.querySelectorAll("span.iqYCVb");
-      spans.forEach((s) => {
-        const num = parsePrice(s.textContent || "");
-        if (Number.isFinite(num)) blockPrices.push(num);
+    // Simple fuzzy: require that either string includes the other
+    if (!(got.includes(target) || target.includes(got))) {
+      console.log("[Google major] H1 does not match hotel name; returning null.", {
+        hotelName,
+        h1Text,
       });
+      return null;
+    }
 
-      if (blockPrices.length) {
-        const minForProvider = Math.min(...blockPrices);
-        majorPrices.push(minForProvider);
+    // Now we are reasonably confident we’re on the right hotel.
+    // Extract OTA tiles and take the minimum across major OTAs.
+    const majorBest = await page.evaluate(() => {
+      const MAJORS = [
+        "expedia",
+        "booking.com",
+        "priceline",
+        "kayak",
+        "hotels.com",
+        "orbitz",
+        "travelocity",
+      ];
+
+      const norm = (s) => (s || "").toLowerCase();
+      const containers = Array.from(document.querySelectorAll(".ADs2Tc"));
+      const prices = [];
+
+      for (const block of containers) {
+        const nameEl = block.querySelector("h3, h4");
+        if (!nameEl) continue;
+
+        const providerName = norm(nameEl.textContent || "");
+        const isMajor = MAJORS.some((m) => providerName.includes(m));
+        if (!isMajor) continue;
+
+        // Grab any dollar amounts in the usual price spans
+        const spans = block.querySelectorAll("span.iqYCVb, span");
+        for (const sp of spans) {
+          const text = (sp.textContent || "").trim();
+          const m = text.match(/\$\s?(\d[\d,]*)/);
+          if (!m) continue;
+          const num = Number(m[1].replace(/,/g, ""));
+          if (Number.isFinite(num)) {
+            prices.push(num);
+          }
+        }
       }
+
+      if (!prices.length) return null;
+      return Math.min(...prices);
     });
 
-    if (!majorPrices.length) return null;
-    return Math.min(...majorPrices);
-  });
+    console.log("[Google major] majorBest:", majorBest);
+    return majorBest;
+  } catch (e) {
+    console.log("[Google major] Error while getting major best:", e?.message || e);
+    return null;
+  }
 }
 
-// ---------- Main exported function ----------
-// IMPORTANT:
-//   • We DO set dates in the UI (so Google matches SB dates).
-//   • google_best comes from the card for those dates.
-//   • google_major_best is best-effort and cannot crash the run.
-
+/**
+ * Main entry: Get Google reference prices for a specific hotel + date range.
+ *
+ * Returns:
+ *  {
+ *    check_in: "YYYY-MM-DD",
+ *    check_out: "YYYY-MM-DD",
+ *    url: "https://www.google.com/travel/search?...",
+ *    google_best: number | null,
+ *    google_major_best: number | null
+ *  }
+ */
 export async function getGoogleHotelsPriceSimple(
   hotelName,
   city,
@@ -256,18 +298,18 @@ export async function getGoogleHotelsPriceSimple(
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-    await page.waitForTimeout(3000); // base load
+    await page.waitForTimeout(3000);
 
-    // Set Google to the SAME dates we’re using on SparrowBid
+    // Set date range via UI (global filter)
     await setDateRangeInUi(page, checkIn, checkOut);
 
-    // Scroll a bit so cards/tooltips render
-    for (let i = 0; i < 2; i++) {
+    // Scroll to encourage cards/tooltips to render
+    for (let i = 0; i < 3; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(600);
     }
 
-    // 1) Google all-OTA reference price (this is what was working before)
+    // 1) This is the trusted metric we already know works reasonably well
     const google_best = await extractSelectedDatesPrice(page, hotelName);
     console.log(
       "[Google] selected-dates price for",
@@ -278,35 +320,23 @@ export async function getGoogleHotelsPriceSimple(
       url
     );
 
-    // 2) OPTIONAL: "major OTA" price (Expedia/Booking/etc.) — totally non-fatal
-    let google_major_best = null;
-    try {
-      await openViewPricesIfExists(page);
-      google_major_best = await extractMajorProviderPrice(page);
-      console.log(
-        "[Google] major-provider price for",
-        hotelName,
-        "=",
-        google_major_best
-      );
-    } catch (err) {
-      console.warn(
-        "[Google] major-provider extraction failed (non-fatal):",
-        String(err)
-      );
-      google_major_best = null;
-    }
+    // 2) Experimental major-OTA best, heavily guard-railed
+    const google_major_best = await getGoogleMajorBest(page, hotelName);
 
-    return {
+    const result = {
       check_in: checkIn,
       check_out: checkOut,
       url,
       google_best,
       google_major_best,
     };
+
+    console.log("[Google] result object:", result);
+    return result;
   } finally {
     await browser.close();
   }
 }
+
 
 
