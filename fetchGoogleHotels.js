@@ -2,11 +2,13 @@
 import dayjs from "dayjs";
 import { chromium } from "playwright";
 
-// Build a Google Travel search URL
+// ----- URL helpers -----
+
 function cleanCity(cityRaw) {
   if (!cityRaw) return "";
   let c = String(cityRaw);
-  c = c.split(" - ")[0]; // "New York, US - 5385 mi away" → "New York, US"
+  // "New York, US - 5385.12 mi away" → "New York, US"
+  c = c.split(" - ")[0];
   return c.trim();
 }
 
@@ -19,11 +21,8 @@ export function makeGoogleSearchUrl(name, city) {
   return `https://www.google.com/travel/search?hl=en&gl=us&q=${q}`;
 }
 
-/**
- * Try to set the date range via the *actual* calendar UI.
- * Returns { success, uiCheckIn, uiCheckOut } where uiCheckIn/out are the strings
- * shown in the input boxes (e.g. "Wed, Nov 26").
- */
+// ----- Date selection in UI -----
+
 async function setDateRangeInUi(page, checkIn, checkOut) {
   const inLabelPart = dayjs(checkIn).format("MMMM D, YYYY");   // "November 26, 2025"
   const outLabelPart = dayjs(checkOut).format("MMMM D, YYYY"); // "November 28, 2025"
@@ -45,10 +44,9 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   }
 
   await dateInput.first().click();
-  // Give the calendar time to appear
-  await page.waitForTimeout(1500);
+  await page.waitForTimeout(1500); // let calendar open
 
-  // 2) Wait for date cells to appear (the real calendar selector you captured)
+  // 2) Wait for date cells to appear (your real calendar selector)
   try {
     await page
       .locator('div[jsname="nEWxA"][aria-label]')
@@ -82,7 +80,7 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   await page.waitForTimeout(300);
   const okOut = await clickDateByLabelPart(outLabelPart);
 
-  // "Done"/"Apply" if present
+  // Click Done / Apply / Save if present
   const doneSelectors = [
     'button:has-text("Done")',
     'button:has-text("Apply")',
@@ -120,15 +118,72 @@ async function setDateRangeInUi(page, checkIn, checkOut) {
   return { success: okIn && okOut, uiCheckIn, uiCheckOut };
 }
 
-/**
- * Extract prices from the page for the current date range.
- * - lowestAll: lowest nightly price from *any* OTA (all providers)
- * - lowestMajor: lowest nightly price among major OTAs:
- *   Expedia, Booking.com, Priceline, Kayak, Hotels.com, Orbitz, Travelocity
- *
- * Uses the provider rows you showed (class ADs2Tc, span.iqYCVb, h3.RjilDd).
- */
-async function extractPriceSummary(page) {
+// ----- Fallback / main-card price (this was working) -----
+
+async function extractSelectedDatesPrice(page, hotelName) {
+  return await page.evaluate((hotelNameInner) => {
+    if (!hotelNameInner) return null;
+
+    const norm = (s) => (s || "").toLowerCase().replace(/\s+/g, " ").trim();
+    const target = norm(hotelNameInner);
+
+    const anchors = Array.from(document.querySelectorAll('a[aria-label]'));
+    const priceRegex = /\$\s?(\d[\d,]*)/;
+
+    for (const a of anchors) {
+      const label = a.getAttribute("aria-label") || "";
+      const labelNorm = norm(label);
+
+      // Loose match: label contains hotel name or vice versa
+      if (!labelNorm.includes(target) && !target.includes(labelNorm)) continue;
+
+      const texts = [];
+      const nodes = Array.from(a.querySelectorAll("span, div"));
+      for (const n of nodes) {
+        const t = (n.textContent || "").replace(/\s+/g, " ").trim();
+        if (!priceRegex.test(t)) continue;
+        texts.push(t);
+      }
+
+      if (!texts.length) continue;
+
+      // Prefer "$XX nightly"
+      const nightly = texts.find((t) => /nightly/i.test(t) && priceRegex.test(t));
+      const chosenText = nightly || texts[0];
+
+      const m = chosenText.match(priceRegex);
+      if (!m) continue;
+      const num = Number(m[1].replace(/,/g, ""));
+      if (!Number.isFinite(num)) continue;
+
+      return num;
+    }
+
+    return null;
+  }, hotelName);
+}
+
+// ----- "View prices" and major-provider parsing -----
+
+async function openViewPricesIfExists(page) {
+  const btn = page.locator('button:has-text("View prices")');
+  const count = await btn.count();
+  if (!count) {
+    console.log("[Google] No 'View prices' button found; maybe already expanded.");
+    return false;
+  }
+  try {
+    await btn.first().click();
+    await page.waitForTimeout(3000); // give panel time to load providers
+    console.log("[Google] Clicked 'View prices' button.");
+    return true;
+  } catch (err) {
+    console.warn("[Google] Failed to click 'View prices':", String(err));
+    return false;
+  }
+}
+
+async function extractMajorProviderPrice(page) {
   return await page.evaluate(() => {
     const priceRegex = /\$\s?(\d[\d,]*)/;
     const parsePrice = (text) => {
@@ -138,15 +193,6 @@ async function extractPriceSummary(page) {
       return m ? Number(m[1].replace(/,/g, "")) : null;
     };
 
-    // 1) Lowest price among *all* OTAs (any provider)
-    const allPrices = [];
-    const priceSpans = document.querySelectorAll("span.iqYCVb");
-    priceSpans.forEach((el) => {
-      const num = parsePrice(el.textContent || "");
-      if (Number.isFinite(num)) allPrices.push(num);
-    });
-
-    // 2) Lowest price among major OTAs only
     const majorBrands = [
       "expedia",
       "booking.com",
@@ -156,6 +202,7 @@ async function extractPriceSummary(page) {
       "orbitz",
       "travelocity",
     ];
+
     const majorPrices = [];
 
     const providerBlocks = document.querySelectorAll(".ADs2Tc");
@@ -180,24 +227,13 @@ async function extractPriceSummary(page) {
       }
     });
 
-    const lowestAll = allPrices.length ? Math.min(...allPrices) : null;
-    const lowestMajor = majorPrices.length ? Math.min(...majorPrices) : null;
-
-    return { lowestAll, lowestMajor };
+    if (!majorPrices.length) return null;
+    return Math.min(...majorPrices);
   });
 }
 
-/**
- * Get ONE Google reference nightly price for a hotel for a specific date range.
- * We ONLY trust the price if the UI dates contain the requested month+day.
- *
- * Returned fields:
- *   - check_in
- *   - check_out
- *   - url
- *   - google_best          → lowest OTA overall (all providers)
- *   - google_major_best    → lowest OTA among the specified major brands
- */
+// ----- Main exported function -----
+
 export async function getGoogleHotelsPriceSimple(
   hotelName,
   city,
@@ -215,13 +251,11 @@ export async function getGoogleHotelsPriceSimple(
 
   try {
     await page.goto(url, { waitUntil: "domcontentloaded", timeout: 120000 });
-    // Let the base UI load
-    await page.waitForTimeout(3000);
+    await page.waitForTimeout(3000); // initial load
 
-    // Set date range via UI and read back the actual dates shown
+    // 1) Set date range via UI and read back actual dates
     const setRes = await setDateRangeInUi(page, checkIn, checkOut);
 
-    // Check if the UI actually shows the dates we wanted (by month+day)
     const wantInShort = dayjs(checkIn).format("MMM D");   // "Nov 26"
     const wantOutShort = dayjs(checkOut).format("MMM D"); // "Nov 28"
     const uiIn = setRes.uiCheckIn || "";
@@ -248,25 +282,29 @@ export async function getGoogleHotelsPriceSimple(
       };
     }
 
-    // Scroll a bit so cards & tooltips render
-    for (let i = 0; i < 3; i++) {
+    // 2) Scroll a bit to ensure cards & buttons render
+    for (let i = 0; i < 2; i++) {
       await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));
       await page.waitForTimeout(600);
     }
 
-    // Extract price summary for these dates
-    const { lowestAll, lowestMajor } = await extractPriceSummary(page);
-    console.log("[Google] price summary for", hotelName, "=", {
-      lowestAll,
-      lowestMajor,
-    });
+    // 3) FIRST: do the same safe "headline" extraction we already know works
+    const google_best = await extractSelectedDatesPrice(page, hotelName);
+    console.log("[Google] selected-dates price for", hotelName, "=", google_best, "URL:", url);
+
+    // 4) THEN: try to open provider panel and compute lowest major OTA price
+    let google_major_best = null;
+    await openViewPricesIfExists(page);
+    google_major_best = await extractMajorProviderPrice(page);
+
+    console.log("[Google] major-provider price for", hotelName, "=", google_major_best);
 
     return {
       check_in: checkIn,
       check_out: checkOut,
       url,
-      google_best: lowestAll,        // lowest OTA overall
-      google_major_best: lowestMajor // lowest among major OTAs
+      google_best,
+      google_major_best,
     };
   } finally {
     await browser.close();
