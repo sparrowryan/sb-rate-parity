@@ -2,169 +2,145 @@
 import dayjs from "dayjs";
 import fetch from "node-fetch";
 import { getSparrowHotels } from "./scrapeSparrowBid.js";
-// Adjust this import name if your Google file exports a different name
-import { getGoogleHotelsPriceSimple as getGoogleHotelsPrices } from "./fetchGoogleHotels.js";
+import { getGoogleHotelsPriceSimple } from "./fetchGoogleHotels.js";
 
 const WEBHOOK = process.env.WEBHOOK_URL;
-
-// Existing config
 const CHECKIN_OFFSET_DAYS = Number(process.env.CHECKIN_OFFSET_DAYS || 7);
 const NIGHTS = Number(process.env.NIGHTS || 2);
+const MAX_HOTELS = Number(process.env.MAX_HOTELS || 100);
+const SCRAPE_MAX_HOTELS = Number(process.env.SCRAPE_MAX_HOTELS || 200); // how many we scrape from Sparrow total
+const DRY_RUN = String(process.env.DRY_RUN || "false").toLowerCase() === "true";
 
-// NEW: testing controls
-const MAX_HOTELS = Number(process.env.MAX_HOTELS || 10); // how many hotels to process per run
-const DRY_RUN =
-  String(process.env.DRY_RUN || "").toLowerCase() === "true" ||
-  process.env.DRY_RUN === "1";
-
-// helpers
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const num = (x) => (typeof x === "number" && isFinite(x) ? x : "");
 
-// For testing: shorter delays if you're only hitting a few hotels
-function getPoliteDelayMs() {
-  if (MAX_HOTELS <= 5) return 300; // faster when testing small sample
-  if (MAX_HOTELS <= 20) return 800;
-  return 1400; // safer for big runs
+// Guard: WEBHOOK required unless DRY_RUN
+if (!DRY_RUN) {
+  if (!WEBHOOK || !/^https?:\/\//i.test(WEBHOOK)) {
+    console.error(
+      "WEBHOOK_URL is not set or invalid. Add it under Settings → Secrets → Actions."
+    );
+    process.exit(1);
+  }
 }
 
 (async () => {
   try {
-    if (!WEBHOOK || !/^https?:\/\//i.test(WEBHOOK)) {
-      throw new Error(
-        "WEBHOOK_URL is not set or invalid. Add it under Settings → Secrets → Actions."
-      );
-    }
+    console.log("=== sb-rate-parity run starting ===");
+    console.log("CONFIG:", {
+      MAX_HOTELS,
+      SCRAPE_MAX_HOTELS,
+      DRY_RUN,
+      CHECKIN_OFFSET_DAYS,
+      NIGHTS,
+    });
 
-    // Derive SparrowBid check-in/check-out window from env
     const base = dayjs().add(CHECKIN_OFFSET_DAYS, "day");
     const checkIn = base.format("YYYY-MM-DD");
     const checkOut = base.add(NIGHTS, "day").format("YYYY-MM-DD");
 
-    console.log("=== sb-rate-parity run starting ===");
-    console.log("CONFIG:", {
-      MAX_HOTELS,
-      DRY_RUN,
-      CHECKIN_OFFSET_DAYS,
-      NIGHTS,
-      sbCheckIn: checkIn,
-      sbCheckOut: checkOut,
-    });
-
-    // -------- SCRAPE SPARROWBID (with pagination + SB URL capture) --------
-    const allHotels = await getSparrowHotels({
-      maxHotels: 600, // still scrape a big pool so we have options
+    // -------- SCRAPE SPARROWBID (DATE-FILTERED) --------
+    const hotels = await getSparrowHotels({
+      maxHotels: SCRAPE_MAX_HOTELS,
       maxPages: 40,
       checkIn,
       checkOut,
     });
 
-    console.log("Total hotels scraped from SparrowBid:", allHotels.length);
-
-    // Apply test cap
-    const hotels = allHotels.slice(0, MAX_HOTELS);
-    console.log(
-      `Processing ${hotels.length} hotels this run (MAX_HOTELS=${MAX_HOTELS})`
-    );
-    console.log("Sample hotels:", hotels.slice(0, 3));
+    console.log("Total hotels scraped from SparrowBid:", hotels.length);
 
     if (!hotels.length) {
-      throw new Error(
-        "SparrowBid scraper returned 0 hotels after slicing. Check selectors."
-      );
+      throw new Error("SparrowBid scraper returned 0 hotels. Check selectors.");
     }
+
+    const toProcess = Math.min(MAX_HOTELS, hotels.length);
+    console.log(`Processing ${toProcess} hotels this run (MAX_HOTELS=${MAX_HOTELS})`);
+    console.log("Sample hotels:", hotels.slice(0, 3));
 
     const today = dayjs().format("YYYY-MM-DD");
     const rows = [];
-    const politeDelay = getPoliteDelayMs();
 
-    for (let i = 0; i < hotels.length; i++) {
+    for (let i = 0; i < toProcess; i++) {
       const h = hotels[i];
-
       console.log(
-        `\n--- [${i + 1}/${hotels.length}] ${h.name} (${h.city || "no city"}) ---`
+        `--- [${i + 1}/${toProcess}] ${h.name} (${h.city || "no city"}) ---`
       );
 
-      // SB price from card (your existing logic)
       const sbPrice = h.priceRaw
         ? Number(h.priceRaw.replace(/[^0-9.]/g, ""))
         : null;
-
       console.log("[SB] raw card price:", h.priceRaw, "parsed:", sbPrice);
 
-      // ---- GOOGLE SIDE ----
-      // NOTE: adjust the args here to match your actual getGoogle... signature.
-      // If you're on the "simple" version that takes explicit dates, update accordingly.
-   const gh = await getGoogleHotelsPrices(h.name, h.city, {
-  checkIn,
-  checkOut,
-});
-
+      // Query Google Hotels for this hotel
+      const gh = await getGoogleHotelsPriceSimple(h.name, h.city, {
+        checkIn,
+        checkOut,
+      });
 
       console.log("[Google] result object:", gh);
 
-      const googleBest =
+      const googleAll =
         typeof gh.google_best === "number" && isFinite(gh.google_best)
           ? gh.google_best
           : null;
-
-      // If later you return ota_min instead of google_best, you can swap that here:
-      // const googleBest = typeof gh.ota_min === "number" && isFinite(gh.ota_min) ? gh.ota_min : null;
-
-      const candidates = [googleBest].filter(
-        (v) => typeof v === "number" && isFinite(v)
-      );
-      const minOta = candidates.length ? Math.min(...candidates) : null;
-
-      const adv$ =
-        sbPrice != null && minOta != null ? minOta - sbPrice : null;
-      const advPct =
-        sbPrice != null && minOta != null && minOta > 0
-          ? (minOta - sbPrice) / minOta
+      const googleMajor =
+        typeof gh.google_major_best === "number" && isFinite(gh.google_major_best)
+          ? gh.google_major_best
           : null;
 
-      console.log("[Computed]", {
-        googleBest,
-        minOta,
-        adv$,
-        advPct,
-      });
+      // SB vs lowest OTA (all providers)
+      const advAll$ =
+        sbPrice != null && googleAll != null ? googleAll - sbPrice : null;
+      const advAllPct =
+        sbPrice != null && googleAll != null && googleAll > 0
+          ? (googleAll - sbPrice) / googleAll
+          : null;
+
+      // SB vs lowest Major OTA
+      const advMaj$ =
+        sbPrice != null && googleMajor != null ? googleMajor - sbPrice : null;
+      const advMajPct =
+        sbPrice != null && googleMajor != null && googleMajor > 0
+          ? (googleMajor - sbPrice) / googleMajor
+          : null;
 
       const row = [
-        today, // Date
-        gh.check_in || "", // Check-in (if your gh object provides it)
-        gh.check_out || "", // Check-out
-        h.name, // Property
-        h.city || "", // City
-        num(sbPrice), // SB Price
-        num(googleBest), // Google Best / OTA-min
-        num(adv$), // SB Advantage $
-        advPct != null ? advPct : "", // SB Advantage %
-        h.url || "", // SB URL (still empty from scraper unless you add it later)
-        gh.url || "", // Google URL
+        today,              // Date of run
+        gh.check_in,        // Check-in
+        gh.check_out,       // Check-out
+        h.name,             // Property
+        h.city || "",       // City
+        num(sbPrice),       // SparrowBid price
+        num(googleAll),     // Lowest OTA (all providers)
+        num(googleMajor),   // Lowest Major OTA (Expedia/Booking/etc.)
+        num(advAll$),       // SB advantage vs ALL OTAs ($)
+        advAllPct != null ? advAllPct : "", // SB advantage vs ALL OTAs (%)
+        num(advMaj$),       // SB advantage vs Major OTAs ($)
+        advMajPct != null ? advMajPct : "", // SB advantage vs Major OTAs (%)
+        h.url || "",        // SB URL (we still synthesize later if needed)
+        gh.url || "",       // Google Hotels URL
       ];
 
       if (DRY_RUN) {
         console.log("[DRY_RUN] Would append row:", row);
-      } else {
-        rows.push(row);
       }
 
-      // Polite pacing between hotel lookups
-      await sleep(politeDelay + Math.floor(Math.random() * 250));
+      rows.push(row);
+
+      // polite pacing between Google Hotels fetches
+      await sleep(1000 + Math.floor(Math.random() * 600));
     }
 
     if (DRY_RUN) {
       console.log(
-        `\n[DRY_RUN] Built ${hotels.length} rows but NOT sending to webhook.`
+        `[DRY_RUN] Built ${rows.length} rows but NOT sending to webhook.`
       );
       console.log("[DRY_RUN] End of run.");
       return;
     }
 
     // -------- SEND TO GOOGLE SHEET VIA WEBHOOK --------
-    console.log("\nSending rows to webhook:", rows.length);
-
+    console.log("Sending", rows.length, "rows to webhook.");
     const res = await fetch(WEBHOOK, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -180,4 +156,5 @@ function getPoliteDelayMs() {
     process.exit(1);
   }
 })();
+
 
