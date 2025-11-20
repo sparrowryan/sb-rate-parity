@@ -42,6 +42,6 @@ jobs:
           # Testing controls:
           # - Start with DRY_RUN="true" and a small MAX_HOTELS
           # - When happy with logs, set DRY_RUN="false" and bump MAX_HOTELS
-          MAX_HOTELS: 5        # only process 5 hotels per run while testing
+          MAX_HOTELS: 10        # only process 5 hotels per run while testing
           DRY_RUN: "true"      # log rows but DO NOT write to the sheet
         run: node index.js
