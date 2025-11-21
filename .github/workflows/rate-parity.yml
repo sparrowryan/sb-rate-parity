@@ -36,7 +36,7 @@ jobs:
 
           # These two are still here in case your Google code uses them;
           # you can remove them once everything is fully "Google-leads" driven.
-          CHECKIN_OFFSET_DAYS: 7
+          CHECKIN_OFFSET_DAYS: 14
           NIGHTS: 2
 
           # Testing controls:
